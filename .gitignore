@@ -71,7 +71,7 @@ results/
 !*/configs/*.yml
 !src/configs/*.yaml
 !src/configs/*.yml
-!dataset/*/*.json
+!dataset/*/*.csv
 !preprocess/*/*.json
 
 # ---------- Project specific: memory / sandbox temp ----------
