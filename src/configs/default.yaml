@@ -1,0 +1,87 @@
+defaults:
+  - _self_
+
+project:
+  name: tacf
+  seed: 42
+  log_dir: logs
+  ckpt_dir: checkpoints
+  device: cuda
+
+data:
+  root: preprocess
+  dataset: ETTh1
+  seq_len: 336
+  pred_len: 168
+  label_len: 168
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+  use_time_features: true
+
+model:
+  in_channels: 7
+  out_channels: 7
+  d_hidden: 512
+
+  decomposer:
+    kernel_trend: 64
+    kernel_cycle: 32
+    kernel_local: 16
+    stride: 1
+    dilation: 1
+    bias: true
+    use_residual: true
+
+  specialist:
+    d_model: 512
+    n_layers: 4
+    d_state: 16
+    d_conv: 4
+    expand: 2
+    dropout: 0.1
+    bidirectional: true
+    norm_eps: 1.0e-5
+
+  consensus:
+    n_rounds: 2
+    d_attn: null
+    num_heads: 4
+    attn_dropout: 0.05
+    use_layer_norm: true
+    residual: true
+    use_inverse_variance: true
+
+  aggregator:
+    d_model: 256
+    n_layers: 2
+    d_state: 16
+    d_conv: 4
+    expand: 2
+    dropout: 0.05
+    bidirectional: true
+    norm_eps: 1.0e-5
+
+training:
+  max_epochs: 100
+  early_stop: 10
+  monitor: val_mse
+  mode: min
+  amp: true
+  grad_clip: 1.0
+  accum_steps: 1
+  warmup_epochs: 5
+  min_lr_factor: 0.01
+  optimizer: adamw
+  lr: 0.001
+  weight_decay: 0.0001
+  beta1: 0.9
+  beta2: 0.999
+
+loss:
+  lambda_nll: 1.0
+  lambda_mse: 1.0
+  lambda_consensus: 0.1
+  lambda_reject: 0.01
+  lambda_orthogonality: 0.01
+  lambda_agent: 0.05

@@ -1,0 +1,78 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ---------- Virtual environment ----------
+.venv/
+venv/
+ENV/
+env/
+
+# ---------- Tools & Editors ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---------- Testing & coverage ----------
+.pytest_cache/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.tox/
+
+# ---------- Jupyter ----------
+.ipynb_checkpoints
+*.ipynb
+
+# ---------- Project specific: logs / checkpoints / outputs ----------
+logs/
+*.pt
+*.pth
+*.ckpt
+events.out.tfevents.*
+
+# ---------- Project specific: figures / results ----------
+figures/
+results/
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.csv
+*.json
+!*/configs/*.yaml
+!*/configs/*.yml
+!src/configs/*.yaml
+!src/configs/*.yml
+!dataset/*/*.json
+
+# ---------- Project specific: memory / sandbox temp ----------
+_debug_*.py
+_tmp_*.py
