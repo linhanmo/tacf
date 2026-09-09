@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 import argparse
 import json
 import os
@@ -86,7 +89,7 @@ def main(argv=None) -> Dict[str, Any]:
         specialist_n_layers=args.n_layers,
         aggregator_d_model=args.agg_d_model,
     )
-    model = build_model_from_dm(dm, override=model_override)
+    model = build_model_from_dm(dm, **model_override)
     print(model)
 
     cfg_common = dict(
