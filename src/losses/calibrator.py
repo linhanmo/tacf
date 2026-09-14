@@ -123,12 +123,37 @@ def reject_regularization(
     weight: float = 0.01,
     target_usage: float = 0.9,
 ) -> torch.Tensor:
-    """Penalise excessive rejection while discouraging r_k ≡ 0 (BCE push-pull)."""
+    """Penalise excessive rejection while discouraging r_k ≡ 0 (BCE push-pull).
+
+    Notes
+    -----
+    ``torch.nn.functional.binary_cross_entropy`` on post-sigmoid probabilities
+    is explicitly **not safe** under ``torch.cuda.amp.autocast`` (PyTorch will
+    raise a ``RuntimeError`` suggesting a move to the *logits* variant).
+
+    Because call sites currently only hold the post-sigmoid ``reject`` tensor
+    (``AggregatorAgent.forward`` applies ``sigmoid`` before returning and does
+    **not** surface the raw logits), we invert the probabilities back to
+    logits via ``torch.logit`` inside a small float32 promotion window, then
+    compute ``F.binary_cross_entropy_with_logits`` — which is fully
+    AMP/GradScaler safe and numerically more stable than applying BCE directly
+    to clamped probabilities.  Call sites and function signatures remain
+    unchanged.
+    """
     usage = 1.0 - reject.mean()
-    loss = weight * F.binary_cross_entropy(
-        reject.clamp(1e-5, 1 - 1e-5),
-        torch.full_like(reject, 1.0 - target_usage),
-    ) + 0.1 * weight * F.relu(0.5 - usage).pow(2)
+    target_p = 1.0 - target_usage
+    orig_dtype = reject.dtype
+    need_promote = orig_dtype != torch.float32 and orig_dtype != torch.float64
+    r = reject.float() if need_promote else reject
+    eps = 1e-5
+    r_clamped = torch.clamp(r, min=eps, max=1.0 - eps)
+    logits = torch.logit(r_clamped, eps=eps)
+    target = torch.full_like(logits, float(target_p))
+    bce = F.binary_cross_entropy_with_logits(logits, target)
+    if need_promote:
+        bce = bce.to(orig_dtype)
+        usage = usage.to(orig_dtype)
+    loss = weight * bce + 0.1 * weight * F.relu(0.5 - usage).pow(2)
     return loss
 
 
