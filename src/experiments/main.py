@@ -59,7 +59,7 @@ def main(argv=None) -> Dict[str, Any]:
     parser.add_argument("--max-epochs-stage2", type=int, default=10)
     parser.add_argument("--max-epochs-stage3", type=int, default=10)
     parser.add_argument("--max-epochs-stage4", type=int, default=20)
-    parser.add_argument("--d_model", type=int, default=512)
+    parser.add_argument("--d-model", type=int, default=512, dest="d_model")
     parser.add_argument("--agg-d-model", type=int, default=256)
     parser.add_argument("--n-layers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)

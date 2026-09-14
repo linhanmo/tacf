@@ -54,10 +54,27 @@ def seasonal_fourier_l1_loss(
     magnitudes of y_hat_k vs target on the lowest ``freq_bands`` frequency
     bins, and returns an L1 discrepancy on those amplitudes.  This biases the
     cycle agent towards fitting seasonal structure rather than trend.
+
+    Notes
+    -----
+    cuFFT has two well-known limitations under AMP / float16:
+      (1) `ComplexHalf` support is experimental and emits warnings.
+      (2) Real FFTs only accept signal lengths that are powers of two when
+          executed in half precision on CUDA.
+    Because common TACF prediction horizons (96, 168, 192, 336, 720, ...)
+    are typically *not* powers of two, we promote inputs to ``float32`` just
+    around the FFT call, then cast the final scalar loss back to the input
+    dtype.  This keeps autocast / GradScaler happy elsewhere and preserves
+    gradient flow through the FFT (all ops are real-valued after ``.abs()``).
     """
+    orig_dtype = y_hat_k.dtype
+    need_promote = orig_dtype != torch.float32 and orig_dtype != torch.float64
     B, P, D = y_hat_k.shape
     yhat = y_hat_k.transpose(1, 2).reshape(-1, P)
     tgt = target.transpose(1, 2).reshape(-1, P)
+    if need_promote:
+        yhat = yhat.float()
+        tgt = tgt.float()
     Fh = torch.fft.rfft(yhat, n=P, dim=-1).abs()
     Ft = torch.fft.rfft(tgt, n=P, dim=-1).abs()
     if freq_bands > Fh.shape[-1]:
@@ -70,10 +87,14 @@ def seasonal_fourier_l1_loss(
     )
     v = (Fh_n - Ft_n).abs()
     if reduce == "mean":
-        return v.mean()
-    if reduce == "sum":
-        return v.sum()
-    return v
+        loss = v.mean()
+    elif reduce == "sum":
+        loss = v.sum()
+    else:
+        loss = v
+    if need_promote and torch.is_tensor(loss):
+        loss = loss.to(orig_dtype)
+    return loss
 
 
 def local_sparsity_l1(
