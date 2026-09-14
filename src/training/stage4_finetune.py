@@ -27,6 +27,8 @@ def _wrap_with_hetero_loss(trainer_cfg: TrainerConfig) -> Any:
             lambda_reject=trainer_cfg.lambda_reject,
             lambda_orthogonality=trainer_cfg.lambda_orthogonality,
             lambda_agent=trainer_cfg.lambda_agent,
+            lambda_cov_penalty=trainer_cfg.lambda_cov_penalty,
+            target_q=trainer_cfg.target_q,
             use_mixture_nll=trainer_cfg.use_mixture_nll,
             agent_hetero=hetero.total,
         )
@@ -42,14 +44,17 @@ def run_stage4_finetune(
     cfg: Optional[TrainerConfig] = None,
     logger: Optional[ExperimentLogger] = None,
     dm=None,
-    lr_mult: float = 0.1,
+    lr_mult: float = 0.03,
+    early_stop_override: Optional[int] = 5,
     **kwargs,
 ):
-    """Stage 4: End-to-end fine-tuning with a reduced learning rate.
+    """Stage 4: End-to-end fine-tuning with a *very* reduced learning rate.
 
-    Unfreezes every component and optimises the full training objective from
-    ``losses.calibrator.build_total_loss`` including the heterogeneous per-
-    specialist structure loss.
+    Analysis on the 8-dataset smoke runs showed S4 regresses on 50% datasets
+    (aggregator α/r weights disturbed by full-update noise). We therefore
+    (a) drop the default lr multiplier from 0.10 → **0.03**,
+    (b) tighten early_stop from TrainerConfig.default (10) → **5**
+        (can be switched off by passing early_stop_override=None).
     """
     if cfg is None:
         cfg = TrainerConfig(**kwargs)
@@ -57,6 +62,8 @@ def run_stage4_finetune(
         cfg = TrainerConfig(**{**asdict(cfg), **kwargs})
     cfg.lr = float(cfg.lr) * float(lr_mult)
     cfg.min_lr_factor = float(cfg.min_lr_factor)
+    if early_stop_override is not None:
+        cfg.early_stop = int(early_stop_override)
     unfreeze_module(model.decomposer)
     unfreeze_module(model.specialists)
     unfreeze_module(model.consensus)
@@ -76,4 +83,5 @@ def run_stage4_finetune(
     )
     result["stage"] = "stage4_finetune"
     result["trainer_config"] = asdict(cfg)
+    result["lr_mult_used"] = float(lr_mult)
     return result

@@ -1,0 +1,64 @@
+# Traffic dataset (hourly, D=862 sensors) - 24GB GPU PRESET, DEFAULT DISABLED in scaled_runs.sh.
+# Use --force-traffic to launch.
+# File preserved per user instruction; removed from active run-plan because dataset is too large for early iteration.
+# ------------------------------------------------------------------
+# MODEL LOCKED: d=384×3 specialist, agg=192×2 (same as elec 24G/8G; DO NOT CHANGE d/n_layers per instruction).
+# Only grad accum tuned for 24GB safe cap = 21.6GB.
+# ------------------------------------------------------------------
+# BS_physical = 2       (2/32 of main-default BS=32 → ~(2/32)*180GB ≈ 11GB < 21.6G safe headroom)
+# accum_steps = 32
+# BS_effective = 2 × 32 = 64
+# ------------------------------------------------------------------
+
+project:
+  name: tacf_traffic_24g
+  seed: 42
+  device: cuda
+  amp: true
+
+data:
+  dataset: traffic
+  root: preprocess
+  seq_len: 336
+  pred_len: 168
+  label_len: 168
+  batch_size: 2
+  num_workers: 4
+  pin_memory: true
+  use_time_features: true
+
+model:
+  specialist:
+    d_model: 384
+    n_layers: 3
+  aggregator:
+    d_model: 192
+    n_layers: 2
+
+training:
+  lr: 6.0e-4
+  weight_decay: 1e-4
+  grad_clip: 1.0
+  warmup_epochs: 5
+  grad_accum_steps: 32
+  stage1_max_epochs: 60
+  stage2_max_epochs: 20
+  stage3_max_epochs: 20
+  stage4_max_epochs: 30
+  early_stop_stage1: 15
+  early_stop_stage2: 8
+  early_stop_stage3: 8
+  early_stop_stage4: 8
+  stage4_lr_mult: 0.03
+  stage4_early_stop: 5
+
+loss:
+  lambda_nll: 2.0
+  lambda_mse: 1.0
+  lambda_consensus: 0.1
+  lambda_reject: 0.01
+  lambda_orthogonality: 0.01
+  lambda_agent: 0.05
+  lambda_cov_penalty: 0.25
+  target_q: 0.95
+  use_mixture_nll: false

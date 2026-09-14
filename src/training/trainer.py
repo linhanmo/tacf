@@ -51,12 +51,14 @@ class TrainerConfig:
     weight_decay: float = 1e-4
     beta1: float = 0.9
     beta2: float = 0.999
-    lambda_nll: float = 1.0
+    lambda_nll: float = 2.0             # post-smoke-run upgrade: was 1.0
     lambda_mse: float = 1.0
     lambda_consensus: float = 0.1
     lambda_reject: float = 0.01
     lambda_orthogonality: float = 0.01
     lambda_agent: float = 0.05
+    lambda_cov_penalty: float = 0.25    # NEW: per-sample under-coverage hinge + batch gap
+    target_q: float = 0.95              # NEW: target quantile for λ_cov_penalty (95% interval)
     use_mixture_nll: bool = False
     inverse_transform_eval: bool = True
 
@@ -206,6 +208,8 @@ class Trainer:
                 lambda_reject=self.cfg.lambda_reject,
                 lambda_orthogonality=self.cfg.lambda_orthogonality,
                 lambda_agent=self.cfg.lambda_agent,
+                lambda_cov_penalty=self.cfg.lambda_cov_penalty,
+                target_q=self.cfg.target_q,
                 use_mixture_nll=self.cfg.use_mixture_nll,
             )
             total = loss_obj.total
@@ -334,6 +338,11 @@ class Trainer:
                     monitor_value=monitor_value,
                     mode=cfg.mode,
                 )
+            # keep trainer-local history copy for return dict (best_stage_selection etc.)
+            try:
+                self.history.append(asdict(row) if hasattr(row, "__dataclass_fields__") else dict(vars(row)))
+            except Exception:
+                self.history.append({"epoch": epoch, "train_loss": row.train_loss, "train_mse": row.train_mse})
 
             better = False
             if best_monitor is None:

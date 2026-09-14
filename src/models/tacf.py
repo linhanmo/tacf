@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .aggregator import AggregatorAgent, AggregatorOutput
 from .agent import AgentGroup, AgentsOutput
@@ -122,6 +124,8 @@ class TACF(nn.Module):
         aggregator_expand: int = 2,
         aggregator_dropout: float = 0.05,
         aggregator_bidirectional: bool = True,
+        # ---------- Sigma calibration (global multiplier, learnable scalar) ----
+        sigma_global_multiplier_init: float = 3.0,
         # ---------- Misc ----------
         norm_eps: float = 1e-5,
     ) -> None:
@@ -133,6 +137,7 @@ class TACF(nn.Module):
         self.seq_len = int(seq_len)
         self.pred_len = int(pred_len)
         self.d_hidden = int(d_hidden)
+        self._sigma_mult_init = float(sigma_global_multiplier_init)
 
         self.decomposer = LearnableDecomposer(
             in_channels=in_channels,
@@ -181,6 +186,14 @@ class TACF(nn.Module):
             dropout=aggregator_dropout,
             bidirectional=aggregator_bidirectional,
             norm_eps=norm_eps,
+        )
+        # Global learnable sigma multiplier.  8-dataset smoke runs showed
+        # systemic under-coverage (all 8 datasets Q95 coverage << 0.95); a
+        # positive scalar multiplier is the simplest, least-biased correction
+        # and can be shrunk back toward 1.0 if the coverage penalty loss feels
+        # the band becomes too wide.
+        self.sigma_global_multiplier = nn.Parameter(
+            torch.tensor(float(sigma_global_multiplier_init), dtype=torch.float32)
         )
         self._init_weights()
 
@@ -233,8 +246,20 @@ class TACF(nn.Module):
             sigma=consensus_out.sigma,
         )
 
+        # ---- Apply the learnable global sigma multiplier.
+        # Parameter is stored as a plain scalar (initialised to the user-supplied
+        # init value, typically 3.0).  We clamp it to a sensible positive range
+        # so early-stage instabilities can't blow sigma up, and then multiply
+        # sigma = sigma_aggregator * mult, clamp floor 1e-4 from head.
+        mult = self.sigma_global_multiplier.clamp(min=0.2, max=20.0)
+        sigma_scaled = (aggregator_out.sigma * mult).clamp(min=1e-4)
+
         aux_losses: Dict[str, torch.Tensor] = {}
         aux_losses["orthogonality"] = self.decomposer.orthogonality_loss(x)
+        # Store sigma multiplier as a tensor-typed scalar for later logging.
+        # Do NOT multiply with sigma_scaled; just detach and reshape to () so
+        # downstream can `float()` it cleanly.
+        aux_losses["sigma_multiplier"] = mult.detach().reshape(())
         if y is not None:
             with torch.no_grad():
                 se = (aggregator_out.y_hat - y).pow(2)
@@ -242,7 +267,7 @@ class TACF(nn.Module):
 
         return TACFOutput(
             y_hat=aggregator_out.y_hat,
-            sigma=aggregator_out.sigma,
+            sigma=sigma_scaled,
             alpha=aggregator_out.alpha,
             reject=aggregator_out.reject,
             effective_weights=aggregator_out.effective_weights,

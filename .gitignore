@@ -77,3 +77,4 @@ results/
 # ---------- Project specific: memory / sandbox temp ----------
 _debug_*.py
 _tmp_*.py
+.trae/

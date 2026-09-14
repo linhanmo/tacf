@@ -18,12 +18,15 @@ __all__ = ["run_stage1_pretrain"]
 def _stage1_loss_builder(model, cfg: TrainerConfig) -> Callable[[Any, torch.Tensor], Any]:
     from dataclasses import dataclass
 
+    from ..losses.calibrator import coverage_penalty
+
     @dataclass
     class _Stage1Loss:
         specialist_nll: torch.Tensor
         specialist_mse: torch.Tensor
         agent_hetero: torch.Tensor
         orthogonality: torch.Tensor
+        coverage_penalty: torch.Tensor
         total: torch.Tensor
 
         def logging_dict(self, prefix: str = "") -> Dict[str, float]:
@@ -32,21 +35,27 @@ def _stage1_loss_builder(model, cfg: TrainerConfig) -> Callable[[Any, torch.Tens
                 f"{prefix}specialist_mse": float(self.specialist_mse.detach().cpu().item()),
                 f"{prefix}agent_hetero": float(self.agent_hetero.detach().cpu().item()),
                 f"{prefix}orthogonality": float(self.orthogonality.detach().cpu().item()),
+                f"{prefix}coverage_penalty": float(self.coverage_penalty.detach().cpu().item()),
                 f"{prefix}total": float(self.total.detach().cpu().item()),
             }
 
     def _loss_fn(out: Any, y: torch.Tensor) -> _Stage1Loss:
         nll_sum = 0.0
         mse_sum = 0.0
+        cov_sum = 0.0
+        n_spec = 0
         mu_dict: Dict[str, torch.Tensor] = {}
         for name, spec in out.specialists_out.outputs.items():
             mu = spec.mu
             sigma = spec.sigma
             nll_sum = nll_sum + gaussian_nll(mu, sigma, y)
             mse_sum = mse_sum + F.mse_loss(mu, y)
+            cov_sum = cov_sum + coverage_penalty(sigma, mu, y, target_q=cfg.target_q)
             mu_dict[name] = mu
-        nll = nll_sum / max(1, len(out.specialists_out.outputs))
-        mse = mse_sum / max(1, len(out.specialists_out.outputs))
+            n_spec += 1
+        nll = nll_sum / max(1, n_spec)
+        mse = mse_sum / max(1, n_spec)
+        cov_loss = cov_sum / max(1, n_spec)
         hetero = build_agent_heterogeneous_losses(mu_dict, y)
         ortho = out.aux_losses.get(
             "orthogonality",
@@ -57,12 +66,14 @@ def _stage1_loss_builder(model, cfg: TrainerConfig) -> Callable[[Any, torch.Tens
             + cfg.lambda_mse * mse
             + cfg.lambda_agent * hetero.total
             + cfg.lambda_orthogonality * ortho
+            + cfg.lambda_cov_penalty * cov_loss
         )
         return _Stage1Loss(
             specialist_nll=nll,
             specialist_mse=mse,
             agent_hetero=hetero.total,
             orthogonality=ortho,
+            coverage_penalty=cov_loss,
             total=total,
         )
 

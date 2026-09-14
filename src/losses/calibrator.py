@@ -26,6 +26,7 @@ class CalibratorOutput:
     reject: torch.Tensor
     orthogonality: torch.Tensor
     agent_hetero: torch.Tensor
+    coverage_penalty: torch.Tensor
     total: torch.Tensor
 
     def logging_dict(self, prefix: str = "") -> Dict[str, float]:
@@ -37,6 +38,7 @@ class CalibratorOutput:
             ("reject", self.reject),
             ("orthogonality", self.orthogonality),
             ("agent_hetero", self.agent_hetero),
+            ("coverage_penalty", self.coverage_penalty),
             ("total", self.total),
         ):
             if torch.is_tensor(v):
@@ -153,15 +155,66 @@ def ece_loss(
     return weight * (covered - q_target).abs()
 
 
+def coverage_penalty(
+    sigma: torch.Tensor,
+    mu: torch.Tensor,
+    y: torch.Tensor,
+    target_q: float = 0.95,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Per-batch differentiable coverage Hinge loss.
+
+    For target_q=0.95 we want the symmetric gaussian interval length
+    ``± z_q·σ`` to contain ``y`` at least 95% of the time. Since
+    ``coverage`` is discrete and non-differentiable, we use the
+    *sample-wise surrogate*:
+
+        width_surrogate = 2·z_q·σ   (the total interval width we pay for)
+        margin = |y − μ|
+        hinge = ReLU( margin − z_q·σ )²   (push σ up whenever it under-covers)
+
+    and add a *global batch-level coverage gap* term:
+
+        gap = ReLU( target_q − batch_coverage_est )²
+
+    where ``batch_coverage_est`` is approximated via a straight-through
+    estimator using Gaussian CDF probability of coverage per sample
+    ``Φ((y−μ)/σ) − Φ((μ−y)/σ)``, which is differentiable and equals the
+    true coverage in expectation for correctly-specified Gaussians.
+
+    Both terms are averaged over (B,P,D) so the magnitude is comparable to
+    MSE in the 0.01–1.0 range (usually needs λ_cov ∈ [0.05, 0.5]).
+    """
+    z_q = torch.special.erfinv(
+        torch.tensor(float(target_q), device=mu.device, dtype=torch.float64)
+    ).to(mu.dtype) * torch.sqrt(torch.tensor(2.0, device=mu.device, dtype=mu.dtype))
+    sigma = torch.clamp(sigma, min=eps)
+    margin = (y - mu).abs()
+    # sample-wise under-cover hinge (σ too small ⇒ margin > z·σ ⇒ penalty)
+    hinge_sample = F.relu(margin - z_q * sigma).pow(2)
+
+    # Expected coverage probability (differentiable):
+    #   p_cover = Φ((margin)/σ) − Φ(−(margin)/σ) = 2Φ(margin/σ) − 1
+    # which is equivalent to erf( margin / (√2 σ) )
+    p_cover = torch.erf(margin / (torch.sqrt(torch.tensor(2.0, device=mu.device, dtype=mu.dtype)) * sigma))
+    # batch-level gap: target_q minus the mean expected coverage (only penalise under-coverage)
+    gap = target_q - p_cover.mean()
+    hinge_batch = F.relu(gap).pow(2)
+
+    return hinge_sample.mean() + 2.0 * hinge_batch
+
+
 def build_total_loss(
     output,  # TACFOutput or MOAForwardOutput-like
     y: torch.Tensor,
-    lambda_nll: float = 1.0,
+    lambda_nll: float = 2.0,
     lambda_mse: float = 1.0,
     lambda_consensus: float = 0.1,
     lambda_reject: float = 0.01,
     lambda_orthogonality: float = 0.01,
     lambda_agent: float = 0.05,
+    lambda_cov_penalty: float = 0.25,
+    target_q: float = 0.95,
     use_mixture_nll: bool = False,
     agent_hetero: Optional[torch.Tensor] = None,
 ) -> CalibratorOutput:
@@ -169,6 +222,12 @@ def build_total_loss(
 
     Total = λ_NLL·NLL + λ_MSE·MSE + λ_C·ConsensusReg + λ_R·RejectReg
           + λ_O·Orthogonality + λ_A·(agent heterogeneous structure loss)
+          + λ_cov·CoveragePenalty   (NEW per smoke-run calibration fix)
+
+    **Post smoke-run defaults (updated):** λ_NLL raised from 1.0→2.0, new
+    λ_cov_penalty=0.25, target_q=0.95.  They force σ to be honest rather
+    than systematically under-estimated (8/8 datasets under-covered on the
+    initial smoke runs: worst-case exchange_rate Q95 coverage only 12.2%).
 
     Parameters
     ----------
@@ -219,6 +278,8 @@ def build_total_loss(
     else:
         agent_term = agent_hetero
 
+    cov_loss = coverage_penalty(output.sigma, output.y_hat, y, target_q=target_q)
+
     total = (
         lambda_nll * nll
         + lambda_mse * mse
@@ -226,6 +287,7 @@ def build_total_loss(
         + lambda_reject * reject
         + lambda_orthogonality * ortho
         + lambda_agent * agent_term
+        + lambda_cov_penalty * cov_loss
     )
     return CalibratorOutput(
         nll=nll,
@@ -234,5 +296,6 @@ def build_total_loss(
         reject=reject,
         orthogonality=ortho,
         agent_hetero=agent_term,
+        coverage_penalty=cov_loss,
         total=total,
     )
