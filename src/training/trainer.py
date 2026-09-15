@@ -4,6 +4,7 @@ import math
 import os
 import random
 import time
+import warnings
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -284,6 +285,33 @@ class Trainer:
         best_payload: Dict[str, Any] | None = None
         best_epoch = -1
         best_monitor: Optional[float] = None
+        # 把当前 stage 名存下来，用于 CSV/JSON 输出中 ``LoggedValues.stage``；
+        # 这样每个 epoch 行都带 stage tag，便于后续分析各阶段的收敛行为。
+        self.current_stage: str = str(tag or "")
+
+        # 屏蔽 PyTorch 对 `scheduler.step(epoch=...)` 形式的弃用警告，以及
+        # 偶发的 step 调用顺序误报。
+        #
+        # 背景：
+        #   * SequentialLR 内部在转发给子 scheduler (LinearLR / CosineAnnealingLR)
+        #     时会附带 `epoch=` 参数，PyTorch 2.x 会为此每个 epoch 刷一条
+        #     "epoch parameter in scheduler.step() was not necessary ... deprecated"
+        #     的 UserWarning，该警告与我们的业务代码无关（因为我们自己的调用
+        #     已经是无参的 self.scheduler.step()）。
+        #   * smoke / 短脚本测试中有时会出现 step 顺序误报，而实际训练循环
+        #     （_train_one_epoch 中先 self.scaler.step(self.optimizer) 再在
+        #      本方法末尾 self.scheduler.step()）顺序是完全正确的。
+        #
+        # 屏蔽策略：只忽略 torch.optim.lr_scheduler 模块抛出的 UserWarning。
+        # 这一范围是可接受的——该模块下所有 UserWarning 都属于 deprecated /
+        # 顺序提醒，不影响任何训练数值正确性；不会误伤模型 / 数据 / loss 等
+        # 其他模块真正需要我们关注的 UserWarning。
+        warnings.filterwarnings(
+            "ignore",
+            category=UserWarning,
+            module=r"torch\.optim\.lr_scheduler",
+        )
+
         for epoch in range(1, cfg.max_epochs + 1):
             t0 = time.time()
             if self.logger is not None:
@@ -305,6 +333,7 @@ class Trainer:
             )
 
             row = LoggedValues(
+                stage=self.current_stage or None,
                 epoch=epoch,
                 elapsed_s=time.time() - t0,
                 train_loss=float(train_loss),
@@ -364,7 +393,77 @@ class Trainer:
                 self.best_epoch = best_epoch
                 self.best_monitor = best_monitor
             elif cfg.early_stop > 0 and (epoch - best_epoch) >= cfg.early_stop:
+                # ----------------------------------------------------------------- 指标打印（早停触发）
+                try:
+                    cur_lr = float(self.optimizer.param_groups[0]["lr"])
+                except Exception:
+                    cur_lr = float("nan")
+                elapsed_str = f"{row.elapsed_s:>6.1f}s"
+                tag_str = f" [{tag}]" if tag else ""
+                header = (
+                    f"\n  EPOCH{tag_str} {epoch:>3}/{cfg.max_epochs}  {elapsed_str}  "
+                    f"LR={cur_lr:.3e}  best@{best_epoch} {cfg.monitor}={best_monitor:.4f}"
+                    f"  ⏹  early stop triggered"
+                )
+                train_str = (
+                    f"    train: loss={row.train_loss:.4f}  mse={row.train_mse:.4f}"
+                )
+                val_str = ""
+                if val_metrics is not None:
+                    val_str = (
+                        f"    val:   mse={row.val_mse:.4f} mae={row.val_mae:.4f} "
+                        f"rmse={row.val_rmse:.4f} corr={row.val_corr:+.4f} "
+                        f"q95_cov={row.val_q95:.3f} nll={row.val_nll:.4f}"
+                    )
+                test_str = ""
+                if test_metrics is not None:
+                    test_str = (
+                        f"    test:  mse={row.test_mse:.4f} mae={row.test_mae:.4f} "
+                        f"rmse={row.test_rmse:.4f} q95_cov={row.test_q95:.3f} "
+                        f"nll={row.test_nll:.4f}"
+                    )
+                lines = [l for l in (header, train_str, val_str, test_str) if l]
+                print("\n".join(lines), flush=True)
                 break
+
+            # --------------------------------------------------------------------- 每个 epoch 的指标打印
+            try:
+                cur_lr = float(self.optimizer.param_groups[0]["lr"])
+            except Exception:
+                cur_lr = float("nan")
+            best_hint = "  ★ new best" if better else ""
+            monitor_delta = ""
+            if not better and best_monitor is not None:
+                delta = monitor_value - best_monitor
+                if cfg.mode == "min":
+                    delta = -delta  # 对于越小越好，显示比 best 差多少
+                monitor_delta = f"  Δbest={delta:+.4e}"
+            elapsed_str = f"{row.elapsed_s:>6.1f}s"
+            tag_str = f" [{tag}]" if tag else ""
+            header = (
+                f"  EPOCH{tag_str} {epoch:>3}/{cfg.max_epochs}  {elapsed_str}  "
+                f"LR={cur_lr:.3e}  {cfg.monitor}={monitor_value:.4f}"
+                f"{monitor_delta}{best_hint}"
+            )
+            train_str = (
+                f"    train: loss={row.train_loss:.4f}  mse={row.train_mse:.4f}"
+            )
+            val_str = ""
+            if val_metrics is not None:
+                val_str = (
+                    f"    val:   mse={row.val_mse:.4f} mae={row.val_mae:.4f} "
+                    f"rmse={row.val_rmse:.4f} corr={row.val_corr:+.4f} "
+                    f"q95_cov={row.val_q95:.3f} nll={row.val_nll:.4f}"
+                )
+            test_str = ""
+            if test_metrics is not None:
+                test_str = (
+                    f"    test:  mse={row.test_mse:.4f} mae={row.test_mae:.4f} "
+                    f"rmse={row.test_rmse:.4f} q95_cov={row.test_q95:.3f} "
+                    f"nll={row.test_nll:.4f}"
+                )
+            lines = [l for l in (header, train_str, val_str, test_str) if l]
+            print("\n".join(lines), flush=True)
 
         if self.logger is not None and self.logger.best_checkpoint_path is not None:
             try:

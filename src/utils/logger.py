@@ -19,6 +19,7 @@ __all__ = ["ExperimentLogger", "save_checkpoint", "load_checkpoint"]
 
 @dataclass
 class LoggedValues:
+    stage: Optional[str] = None
     epoch: int
     elapsed_s: float
     train_loss: float
@@ -123,13 +124,32 @@ class ExperimentLogger:
                         pass
 
     def _append_csv(self, payload: Dict[str, Any]) -> None:
-        fieldnames = sorted(payload.keys())
-        write_header = not self.csv_path.exists()
-        with open(self.csv_path, "a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            if write_header:
+        all_keys: set = set()
+        for r in self._rows:
+            all_keys.update(r.keys())
+        fieldnames = sorted(all_keys)
+        # 如果之前写入过 CSV，但旧的字段集合与当前完整字段集合不匹配（通常因为
+        # 某个 stage 新增了列，比如 ``stage``、``extra_*``），则把 CSV 整体
+        # 重写一次，这样所有历史行 + 新行的列完全对齐，没有错位/缺列风险。
+        rewrite_needed = False
+        if self.csv_path.exists():
+            try:
+                with open(self.csv_path, "r", newline="") as f:
+                    reader = csv.reader(f)
+                    existing_header = next(reader, [])
+            except Exception:
+                existing_header = []
+            rewrite_needed = (set(existing_header) != set(fieldnames))
+        if rewrite_needed or (not self.csv_path.exists()):
+            with open(self.csv_path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
                 w.writeheader()
-            w.writerow({k: payload.get(k, "") for k in fieldnames})
+                for r in self._rows:
+                    w.writerow({k: r.get(k, "") for k in fieldnames})
+        else:
+            with open(self.csv_path, "a", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writerow({k: payload.get(k, "") for k in fieldnames})
         with open(self.json_path, "w") as f:
             json.dump(self._rows, f, indent=2, default=str)
 
