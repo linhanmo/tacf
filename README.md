@@ -52,7 +52,7 @@ uv pip install setuptools
 uv pip install https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.4.0/causal_conv1d-1.4.0+cu122torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 uv pip install https://github.com/state-spaces/mamba/releases/download/v2.2.2/mamba_ssm-2.2.2+cu122torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 uv pip install "transformers==4.44.2"
-uv pip install "tokenizers<0.20" "numpy<2"  sklearn-learn # 进入下一步：验证安装
+uv pip install "tokenizers<0.20" "numpy<2"  scikit-learn # 进入下一步：验证安装
 ```
 
 # 验证安装
