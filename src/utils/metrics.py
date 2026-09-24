@@ -149,7 +149,7 @@ def compute_metrics(
     targets_list: Sequence[torch.Tensor],
     sigmas_list: Optional[Sequence[torch.Tensor]] = None,
     q: float = 0.95,
-    eps_nll: float = 1e-6,
+    eps_nll: float = 1e-3,
     temperature: float = 1.0,
 ) -> MetricsResult:
     """Compute aggregate metrics across a list of mini-batch outputs.

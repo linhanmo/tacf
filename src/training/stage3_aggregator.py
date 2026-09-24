@@ -4,7 +4,12 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, Optional
 
 from .trainer import Trainer, TrainerConfig, freeze_module, unfreeze_module
-from ..losses.calibrator import reject_regularization, gaussian_nll
+from ..losses.calibrator import (
+    reject_regularization,
+    gaussian_nll,
+    ece_loss,
+    reject_distribution_penalty,
+)
 import torch
 import torch.nn.functional as F
 from ..utils.logger import ExperimentLogger
@@ -19,6 +24,8 @@ def _stage3_loss_builder(cfg: TrainerConfig) -> Callable[[Any, torch.Tensor], An
         nll: torch.Tensor
         mse: torch.Tensor
         reject_reg: torch.Tensor
+        ece_penalty: torch.Tensor
+        reject_dist_penalty: torch.Tensor
         total: torch.Tensor
 
         def logging_dict(self, prefix: str = "") -> Dict[str, float]:
@@ -26,24 +33,43 @@ def _stage3_loss_builder(cfg: TrainerConfig) -> Callable[[Any, torch.Tensor], An
                 f"{prefix}nll": float(self.nll.detach().cpu().item()),
                 f"{prefix}mse": float(self.mse.detach().cpu().item()),
                 f"{prefix}reject_reg": float(self.reject_reg.detach().cpu().item()),
+                f"{prefix}ece": float(self.ece_penalty.detach().cpu().item()),
+                f"{prefix}reject_dist": float(self.reject_dist_penalty.detach().cpu().item()),
                 f"{prefix}total": float(self.total.detach().cpu().item()),
             }
 
     def _loss_fn(out: Any, y: torch.Tensor) -> _Stage3Loss:
+        lece = float(getattr(cfg, "lambda_ece", 0.0) or 0.0)
+        lrd = float(getattr(cfg, "lambda_reject_dist", 0.0) or 0.0)
+        sreg = float(getattr(cfg, "sigma_reg_weight", 0.0) or 0.0)
         nll = gaussian_nll(
             out.y_hat,
             out.sigma,
             y,
-            sigma_reg_weight=float(getattr(cfg, "sigma_reg_weight", 0.0) or 0.0),
+            sigma_reg_weight=sreg,
         )
         mse = F.mse_loss(out.y_hat, y)
         rreg = reject_regularization(out.reject, weight=1.0)
+        ece_term = (
+            ece_loss(out.sigma, out.y_hat, y,
+                     q_target=float(getattr(cfg, "target_q", 0.95)), weight=1.0)
+            if lece > 0 else torch.zeros((), device=y.device, dtype=y.dtype)
+        )
+        rdist_term = (
+            reject_distribution_penalty(out.reject)
+            if lrd > 0 else torch.zeros((), device=y.device, dtype=y.dtype)
+        )
         total = (
             cfg.lambda_nll * nll
             + cfg.lambda_mse * mse
             + cfg.lambda_reject * rreg
+            + lece * ece_term
+            + lrd * rdist_term
         )
-        return _Stage3Loss(nll=nll, mse=mse, reject_reg=rreg, total=total)
+        return _Stage3Loss(
+            nll=nll, mse=mse, reject_reg=rreg,
+            ece_penalty=ece_term, reject_dist_penalty=rdist_term, total=total,
+        )
 
     return _loss_fn
 

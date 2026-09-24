@@ -60,7 +60,7 @@ def gaussian_nll(
     mu: torch.Tensor,
     sigma: torch.Tensor,
     y: torch.Tensor,
-    eps: float = 1e-6,
+    eps: float = 1e-3,
     reduction: str = "mean",
     sigma_reg_weight: float = 0.0,
 ) -> torch.Tensor:
@@ -77,8 +77,15 @@ def gaussian_nll(
         this translates to a stable ~1 std width which the MSE / coverage
         penalty can then finely tune.  0.01–0.05 is a good starting weight.
     """
-    sigma = torch.clamp(sigma, min=eps)
-    var = sigma.pow(2)
+    # Numerical-safety clamp applies ONLY to 1/var and log(var) in the NLL
+    # formula; we do NOT clamp sigma when computing the sigma_regulariser term,
+    # because clamping to eps would cut off gradients for σ_i < eps — leaving
+    # predicted σ=1e-9 with no gradient signal to "grow back up" to σ≈1.0.
+    # We also clamp log-argument separately from sigma itself so that the
+    # regulariser's log(sigma) safely returns log(eps) for tiny sigmas, but
+    # still propagates a huge d(log σ)/dσ = 1/σ gradient that pushes σ up.
+    sigma_numerical = torch.clamp(sigma, min=eps)
+    var = sigma_numerical.pow(2)
     per = 0.5 * (
         torch.log(2 * torch.pi * var) + (mu - y).pow(2) / var
     )
@@ -89,7 +96,11 @@ def gaussian_nll(
     else:
         base = per
     if sigma_reg_weight and sigma_reg_weight > 0:
-        reg = sigma.mean() + torch.log(sigma).mean()
+        # σ_regulariser convex term: σ + log σ is minimised at σ=1.
+        # Use sigma (not clamped) on the log-arg with a clamp-on-argument only
+        # so d/dσ remains 1 + 1/sigma and pushes small sigmas upward strongly.
+        sigma_reg_arg = sigma.clamp(min=eps * 1e-2)   # tiny floor for finite log only
+        reg = sigma.mean() + torch.log(sigma_reg_arg).mean()
         if reduction == "sum":
             reg = reg * sigma.numel()
         base = base + sigma_reg_weight * reg
@@ -559,7 +570,7 @@ def temperature_scale_nll(
     max_iter: int = 200,
     grid_points: int = 41,
     lbfgs_iter: int = 80,
-    eps: float = 1e-6,
+    eps: float = 1e-3,
 ) -> Dict[str, Any]:
     """Two-stage T-scaling: coarse grid search + L-BFGS refinement.
 

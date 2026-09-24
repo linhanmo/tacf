@@ -29,6 +29,10 @@ def _wrap_with_hetero_loss(trainer_cfg: TrainerConfig) -> Any:
             lambda_agent=trainer_cfg.lambda_agent,
             lambda_cov_penalty=trainer_cfg.lambda_cov_penalty,
             target_q=trainer_cfg.target_q,
+            sigma_reg_weight=float(getattr(trainer_cfg, "sigma_reg_weight", 0.0) or 0.0),
+            lambda_ece=float(getattr(trainer_cfg, "lambda_ece", 0.0) or 0.0),
+            lambda_crps=float(getattr(trainer_cfg, "lambda_crps", 0.0) or 0.0),
+            lambda_reject_dist=float(getattr(trainer_cfg, "lambda_reject_dist", 0.0) or 0.0),
             use_mixture_nll=trainer_cfg.use_mixture_nll,
             agent_hetero=hetero.total,
         )

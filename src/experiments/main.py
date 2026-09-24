@@ -157,6 +157,7 @@ def main(argv=None) -> Dict[str, Any]:
         mode="min",
         lambda_mse=1.0,
         lambda_nll=0.05,            # S1: MSE primary, tiny NLL to keep σ non-trivial
+        sigma_reg_weight=0.01,      # S1 protection: prevent log-sigma collapse to −∞ (σ→0)
     ))
     cfg_s2 = dict(cfg_common)
     cfg_s2.update(dict(
@@ -164,7 +165,7 @@ def main(argv=None) -> Dict[str, Any]:
         mode="min",
         lambda_mse=1.0,
         lambda_nll=0.1,
-        sigma_reg_weight=0.01,                  # mild σ convex regulariser (keep away from ∞)
+        sigma_reg_weight=0.02,                  # σ convex regulariser (keep away from 0/∞)
         s2_warm_epochs=5,
         s2_warm_lr_mult=0.1,
     ))
@@ -175,7 +176,7 @@ def main(argv=None) -> Dict[str, Any]:
         lambda_nll=1.0,
         lambda_mse=0.2,                         # small MSE to keep point estimates non-degenerate
         lambda_ece=0.5,                         # ECE gap penalty for calibration
-        sigma_reg_weight=0.02,                  # slightly stronger σ regularization
+        sigma_reg_weight=0.05,                  # stronger σ regularization: keep σ around 1 std
         lambda_reject_dist=0.2,                 # r_k histogram target mean / std / entropy
         lambda_cov_penalty=0.3,                 # boost coverage hinge
     ))
@@ -187,7 +188,7 @@ def main(argv=None) -> Dict[str, Any]:
         lambda_mse=0.2,                         # keep tie-breaking MSE guidance
         lambda_ece=0.3,                         # calibration aux
         lambda_crps=0.5,                        # CRPS probabilistic secondary replaces RMSE
-        sigma_reg_weight=0.01,                  # mild σ regulariser
+        sigma_reg_weight=0.03,                  # mild σ regulariser
         lambda_cov_penalty=0.3,
     ))
 

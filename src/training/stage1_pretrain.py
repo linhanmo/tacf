@@ -45,10 +45,11 @@ def _stage1_loss_builder(model, cfg: TrainerConfig) -> Callable[[Any, torch.Tens
         cov_sum = 0.0
         n_spec = 0
         mu_dict: Dict[str, torch.Tensor] = {}
+        sreg = float(getattr(cfg, "sigma_reg_weight", 0.0) or 0.0)
         for name, spec in out.specialists_out.outputs.items():
             mu = spec.mu
             sigma = spec.sigma
-            nll_sum = nll_sum + gaussian_nll(mu, sigma, y)
+            nll_sum = nll_sum + gaussian_nll(mu, sigma, y, sigma_reg_weight=sreg)
             mse_sum = mse_sum + F.mse_loss(mu, y)
             cov_sum = cov_sum + coverage_penalty(sigma, mu, y, target_q=cfg.target_q)
             mu_dict[name] = mu

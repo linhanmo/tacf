@@ -341,8 +341,18 @@ class Trainer:
                     mse_weight=float(getattr(cfg, "composite_mse_weight", 0.5)),
                     fallback=float("inf"),
                 )
+            # cfg.monitor is usually written as "val_mse" / "val_nll" / ... but
+            # MetricsResult stores plain names ("mse" / "nll" / "crps" / ...).
+            # Also tolerate users passing the plain name.  NaN maps to ±inf.
             if val_m is not None:
-                raw = getattr(val_m, cfg.monitor, fallback_loss)
+                key = str(cfg.monitor)
+                for candidate in (key, key[4:] if key.startswith("val_") else None,
+                                  ("val_" + key) if not key.startswith("val_") else None):
+                    if candidate and hasattr(val_m, candidate):
+                        raw = getattr(val_m, candidate)
+                        break
+                else:
+                    raw = fallback_loss
             else:
                 raw = fallback_loss
             try:
