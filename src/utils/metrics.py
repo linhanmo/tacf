@@ -26,25 +26,42 @@ __all__ = [
 class MetricsResult:
     mse: float
     mae: float
-    rmse: float
+    rmse: float                  # Legacy field retained for CSV compatibility; new code should
+                                  # treat RMSE as deprecated (use CRPS for probabilistic scoring).
     mape: float
     corr: float
     rse: float
-    q95_coverage: float
+    # --------------- probabilistic coverage (3 quantiles) ---------------
+    q50_coverage: float           # 50% interval coverage — target 0.50
+    q50_width: float
+    q90_coverage: float           # 90% interval coverage — target 0.90
+    q90_width: float
+    q95_coverage: float           # 95% interval coverage — target 0.95
     q95_width: float
-    nll: float
+    # --------------- calibration / probabilistic metrics ---------------
+    nll: float                    # Gaussian NLL (smaller = better)
+    crps: float                   # Closed-form Gaussian CRPS — ⚠ replaces RMSE for probabilistic use
+    ece: float                    # Expected calibration error (|avg coverage − target_q| on Q95)
 
     def format(self, short: bool = False) -> str:
+        # NOTE: RMSE no longer printed per standard practice for time-series
+        # probabilistic benchmarks.  If you need RMSE for legacy comparison, read
+        # directly from ``.rmse`` or ``as_dict()['rmse']``.
         if short:
             return (
-                f"MSE={self.mse:.4f}  MAE={self.mae:.4f}  RMSE={self.rmse:.4f}  "
-                f"MAPE={self.mape:.2f}%  CORR={self.corr:.4f}  RSE={self.rse:.4f}  "
-                f"Q95Cov={self.q95_coverage:.3f}  NLL={self.nll:.4f}"
+                f"MSE={self.mse:.4f}  MAE={self.mae:.4f}  "
+                f"MAPE={self.mape:.2f}%  CORR={self.corr:.4f}  "
+                f"NLL={self.nll:.4f}  CRPS={self.crps:.4f}  "
+                f"Q50={self.q50_coverage:.2f}  Q90={self.q90_coverage:.2f}  Q95={self.q95_coverage:.2f}  "
+                f"ECE={self.ece:.3f}"
             )
         return (
-            f"MSE={self.mse:.6f}  MAE={self.mae:.6f}  RMSE={self.rmse:.6f}  "
-            f"MAPE={self.mape:.4f}%  CORR={self.corr:.4f}  RSE={self.rse:.4f}  "
-            f"Q95Cov={self.q95_coverage:.3f}  Q95W={self.q95_width:.4f}  NLL={self.nll:.4f}"
+            f"MSE={self.mse:.6f}  MAE={self.mae:.6f}  MAPE={self.mape:.4f}%  CORR={self.corr:.4f}  |  "
+            f"NLL={self.nll:.4f}  CRPS={self.crps:.5f}  |  "
+            f"Q50={self.q50_coverage:.3f}(w={self.q50_width:.4f})  "
+            f"Q90={self.q90_coverage:.3f}(w={self.q90_width:.4f})  "
+            f"Q95={self.q95_coverage:.3f}(w={self.q95_width:.4f})  |  "
+            f"ECE={self.ece:.4f}"
         )
 
     def as_dict(self) -> Dict[str, float]:
@@ -133,6 +150,7 @@ def compute_metrics(
     sigmas_list: Optional[Sequence[torch.Tensor]] = None,
     q: float = 0.95,
     eps_nll: float = 1e-6,
+    temperature: float = 1.0,
 ) -> MetricsResult:
     """Compute aggregate metrics across a list of mini-batch outputs.
 
@@ -142,8 +160,14 @@ def compute_metrics(
     targets_list : sequence of tensors matching ``preds_list``
     sigmas_list : optional sequence of tensors matching ``preds_list`` — if
         omitted NLL and coverage are reported as NaN / 0 respectively.
-    q : coverage quantile (default 0.95)
+    q : float, default 0.95
+        Target quantile for the Q95 coverage check; Q50/Q90 are always fixed at
+        0.50 / 0.90 regardless of this value.
     eps_nll : small floor for sigma before computing NLL
+    temperature : float, default 1.0
+        Post-hoc T-scaling factor applied to **all** sigmas (``σ' = T·σ``).
+        The temperature found on the validation split should be passed in when
+        computing test-set metrics for the final S4 report.
     """
     pred = torch.cat([p.detach() for p in preds_list], dim=0)
     target = torch.cat([t.detach() for t in targets_list], dim=0)
@@ -153,6 +177,8 @@ def compute_metrics(
     else:
         sigma = torch.cat([s.detach() for s in sigmas_list], dim=0)
         sigma = torch.clamp(sigma, min=eps_nll)
+        if temperature != 1.0:
+            sigma = sigma * float(temperature)
         has_sigma = True
 
     mse_v = float(mse(pred, target).cpu().item())
@@ -163,18 +189,29 @@ def compute_metrics(
     rse_v = float(relative_squared_error(pred, target).cpu().item())
 
     if has_sigma:
-        q95_c, q95_w = quantile_coverage_probability(pred, sigma, target, q=q)
-        q95_cv = float(q95_c.cpu().item())
-        q95_wv = float(q95_w.cpu().item())
+        q50_c, q50_w = quantile_coverage_probability(pred, sigma, target, q=0.50)
+        q90_c, q90_w = quantile_coverage_probability(pred, sigma, target, q=0.90)
+        q95_c, q95_w = quantile_coverage_probability(pred, sigma, target, q=max(q, 0.95))
+        q50_cv = float(q50_c.cpu().item()); q50_wv = float(q50_w.cpu().item())
+        q90_cv = float(q90_c.cpu().item()); q90_wv = float(q90_w.cpu().item())
+        q95_cv = float(q95_c.cpu().item()); q95_wv = float(q95_w.cpu().item())
         nll_v = float(
             _gaussian_nll_np(
                 pred.cpu().numpy(), sigma.cpu().numpy(), target.cpu().numpy()
             )
         )
+        # Closed-form Gaussian CRPS
+        from ..losses.calibrator import gaussian_crps
+        crps_v = float(gaussian_crps(pred, sigma, target, reduction="mean").cpu().item())
+        # ECE (|coverage − q_target|) — approximate, scalar gap (matching ece_loss())
+        ece_v = float(abs(float(q95_cv) - 0.95)) if q >= 0.95 else float(abs(float(q95_cv) - q))
     else:
-        q95_cv = float("nan")
-        q95_wv = float("nan")
+        q50_cv = q50_wv = float("nan")
+        q90_cv = q90_wv = float("nan")
+        q95_cv = q95_wv = float("nan")
         nll_v = float("nan")
+        crps_v = float("nan")
+        ece_v = float("nan")
 
     return MetricsResult(
         mse=mse_v,
@@ -183,7 +220,13 @@ def compute_metrics(
         mape=mape_v,
         corr=corr_v,
         rse=rse_v,
+        q50_coverage=q50_cv,
+        q50_width=q50_wv,
+        q90_coverage=q90_cv,
+        q90_width=q90_wv,
         q95_coverage=q95_cv,
         q95_width=q95_wv,
         nll=nll_v,
+        crps=crps_v,
+        ece=ece_v,
     )

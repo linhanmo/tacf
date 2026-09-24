@@ -19,22 +19,36 @@ __all__ = ["ExperimentLogger", "save_checkpoint", "load_checkpoint"]
 
 @dataclass
 class LoggedValues:
-    stage: Optional[str] = None
     epoch: int
     elapsed_s: float
     train_loss: float
+    stage: Optional[str] = None
     train_mse: Optional[float] = None
     val_mse: Optional[float] = None
     val_mae: Optional[float] = None
-    val_rmse: Optional[float] = None
     val_corr: Optional[float] = None
-    val_q95: Optional[float] = None
     val_nll: Optional[float] = None
+    val_crps: Optional[float] = None                # NEW: closed-form Gaussian CRPS
+    val_ece: Optional[float] = None                 # NEW: Q95 |coverage - 0.95|
+    val_q50: Optional[float] = None                 # NEW: 50% interval coverage
+    val_q90: Optional[float] = None                 # NEW: 90% interval coverage
+    val_q95: Optional[float] = None
+    val_q50_width: Optional[float] = None           # NEW: 50% width
+    val_q90_width: Optional[float] = None           # NEW: 90% width
+    val_q95_width: Optional[float] = None           # NEW: 95% width
+    val_rmse: Optional[float] = None                # Legacy / deprecated for reporting
     test_mse: Optional[float] = None
     test_mae: Optional[float] = None
-    test_rmse: Optional[float] = None
-    test_q95: Optional[float] = None
     test_nll: Optional[float] = None
+    test_crps: Optional[float] = None               # NEW
+    test_ece: Optional[float] = None                # NEW
+    test_q50: Optional[float] = None                # NEW
+    test_q90: Optional[float] = None                # NEW
+    test_q95: Optional[float] = None
+    test_q50_width: Optional[float] = None          # NEW
+    test_q90_width: Optional[float] = None          # NEW
+    test_q95_width: Optional[float] = None          # NEW
+    test_rmse: Optional[float] = None               # Legacy / deprecated
     extra: Dict[str, Any] | None = None
 
 

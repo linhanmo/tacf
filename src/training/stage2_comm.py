@@ -38,7 +38,12 @@ def _stage2_loss_builder(cfg: TrainerConfig) -> Callable[[Any, torch.Tensor], An
         mu = out.consensus_out.mu
         sigma = out.consensus_out.sigma
         y4 = y.unsqueeze(1).expand(B, K, P, D)
-        nll = gaussian_nll(mu, sigma, y4)
+        nll = gaussian_nll(
+            mu,
+            sigma,
+            y4,
+            sigma_reg_weight=float(getattr(cfg, "sigma_reg_weight", 0.0) or 0.0),
+        )
         mse = F.mse_loss(mu, y4)
         creg = consensus_regularization(
             out.consensus_out.delta_mu,

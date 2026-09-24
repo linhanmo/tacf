@@ -30,7 +30,12 @@ def _stage3_loss_builder(cfg: TrainerConfig) -> Callable[[Any, torch.Tensor], An
             }
 
     def _loss_fn(out: Any, y: torch.Tensor) -> _Stage3Loss:
-        nll = gaussian_nll(out.y_hat, out.sigma, y)
+        nll = gaussian_nll(
+            out.y_hat,
+            out.sigma,
+            y,
+            sigma_reg_weight=float(getattr(cfg, "sigma_reg_weight", 0.0) or 0.0),
+        )
         mse = F.mse_loss(out.y_hat, y)
         rreg = reject_regularization(out.reject, weight=1.0)
         total = (
