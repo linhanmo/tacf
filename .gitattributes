@@ -1,3 +1,0 @@
-dataset/**/*.csv filter=lfs diff=lfs merge=lfs -text
-preprocess/**/*.npz filter=lfs diff=lfs merge=lfs -text
-preprocess/**/*.pkl filter=lfs diff=lfs merge=lfs -text

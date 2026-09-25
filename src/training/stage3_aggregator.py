@@ -39,6 +39,7 @@ def _stage3_loss_builder(cfg: TrainerConfig) -> Callable[[Any, torch.Tensor], An
             }
 
     def _loss_fn(out: Any, y: torch.Tensor) -> _Stage3Loss:
+        dev = y.device
         lece = float(getattr(cfg, "lambda_ece", 0.0) or 0.0)
         lrd = float(getattr(cfg, "lambda_reject_dist", 0.0) or 0.0)
         sreg = float(getattr(cfg, "sigma_reg_weight", 0.0) or 0.0)
@@ -47,25 +48,31 @@ def _stage3_loss_builder(cfg: TrainerConfig) -> Callable[[Any, torch.Tensor], An
             out.sigma,
             y,
             sigma_reg_weight=sreg,
-        )
-        mse = F.mse_loss(out.y_hat, y)
+        ).to(device=dev, dtype=torch.float32)
+        mse = F.mse_loss(out.y_hat.float(), y.float())
         rreg = reject_regularization(out.reject, weight=1.0)
+        if torch.is_tensor(rreg):
+            rreg = rreg.to(device=dev, dtype=torch.float32)
+        else:
+            rreg = torch.as_tensor(rreg, device=dev, dtype=torch.float32)
         ece_term = (
             ece_loss(out.sigma, out.y_hat, y,
                      q_target=float(getattr(cfg, "target_q", 0.95)), weight=1.0)
-            if lece > 0 else torch.zeros((), device=y.device, dtype=y.dtype)
+            .to(device=dev, dtype=torch.float32)
+            if lece > 0 else torch.zeros((), device=dev, dtype=torch.float32)
         )
         rdist_term = (
             reject_distribution_penalty(out.reject)
-            if lrd > 0 else torch.zeros((), device=y.device, dtype=y.dtype)
+            .to(device=dev, dtype=torch.float32)
+            if lrd > 0 else torch.zeros((), device=dev, dtype=torch.float32)
         )
         total = (
-            cfg.lambda_nll * nll
-            + cfg.lambda_mse * mse
-            + cfg.lambda_reject * rreg
+            float(cfg.lambda_nll) * nll
+            + float(cfg.lambda_mse) * mse
+            + float(cfg.lambda_reject) * rreg
             + lece * ece_term
             + lrd * rdist_term
-        )
+        ).to(dtype=y.dtype)
         return _Stage3Loss(
             nll=nll, mse=mse, reject_reg=rreg,
             ece_penalty=ece_term, reject_dist_penalty=rdist_term, total=total,

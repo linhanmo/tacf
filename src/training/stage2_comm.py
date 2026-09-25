@@ -43,19 +43,23 @@ def _stage2_loss_builder(cfg: TrainerConfig) -> Callable[[Any, torch.Tensor], An
             sigma,
             y4,
             sigma_reg_weight=float(getattr(cfg, "sigma_reg_weight", 0.0) or 0.0),
-        )
-        mse = F.mse_loss(mu, y4)
+        ).to(torch.float32)
+        mse = F.mse_loss(mu.float(), y4.float())
         creg = consensus_regularization(
             out.consensus_out.delta_mu,
             out.consensus_out.delta_sigma,
             getattr(out.consensus_out, "comm_weights", None),
             weight=1.0,
         )
+        if torch.is_tensor(creg):
+            creg = creg.to(device=y.device, dtype=torch.float32)
+        else:
+            creg = torch.as_tensor(creg, device=y.device, dtype=torch.float32)
         total = (
-            cfg.lambda_nll * nll
-            + cfg.lambda_mse * mse
-            + cfg.lambda_consensus * creg
-        )
+            float(cfg.lambda_nll) * nll
+            + float(cfg.lambda_mse) * mse
+            + float(cfg.lambda_consensus) * creg
+        ).to(dtype=y.dtype)
         return _Stage2Loss(
             consensus_nll=nll,
             consensus_mse=mse,

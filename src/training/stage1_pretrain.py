@@ -40,35 +40,42 @@ def _stage1_loss_builder(model, cfg: TrainerConfig) -> Callable[[Any, torch.Tens
             }
 
     def _loss_fn(out: Any, y: torch.Tensor) -> _Stage1Loss:
-        nll_sum = 0.0
-        mse_sum = 0.0
-        cov_sum = 0.0
+        dev = y.device
+        dt = y.dtype
+        nll_sum = torch.zeros((), device=dev, dtype=torch.float32)
+        mse_sum = torch.zeros((), device=dev, dtype=torch.float32)
+        cov_sum = torch.zeros((), device=dev, dtype=torch.float32)
         n_spec = 0
         mu_dict: Dict[str, torch.Tensor] = {}
         sreg = float(getattr(cfg, "sigma_reg_weight", 0.0) or 0.0)
         for name, spec in out.specialists_out.outputs.items():
             mu = spec.mu
             sigma = spec.sigma
-            nll_sum = nll_sum + gaussian_nll(mu, sigma, y, sigma_reg_weight=sreg)
-            mse_sum = mse_sum + F.mse_loss(mu, y)
-            cov_sum = cov_sum + coverage_penalty(sigma, mu, y, target_q=cfg.target_q)
+            nll_sum = nll_sum + gaussian_nll(mu, sigma, y, sigma_reg_weight=sreg).to(torch.float32)
+            mse_sum = mse_sum + F.mse_loss(mu.float(), y.float())
+            cov_sum = cov_sum + coverage_penalty(sigma, mu, y, target_q=cfg.target_q).to(torch.float32)
             mu_dict[name] = mu
             n_spec += 1
-        nll = nll_sum / max(1, n_spec)
-        mse = mse_sum / max(1, n_spec)
-        cov_loss = cov_sum / max(1, n_spec)
+        denom = max(1, n_spec)
+        nll = nll_sum / denom
+        mse = mse_sum / denom
+        cov_loss = cov_sum / denom
         hetero = build_agent_heterogeneous_losses(mu_dict, y)
         ortho = out.aux_losses.get(
             "orthogonality",
-            torch.zeros((), device=y.device, dtype=y.dtype),
+            torch.zeros((), device=dev, dtype=torch.float32),
         )
+        if not torch.is_tensor(ortho):
+            ortho = torch.as_tensor(ortho, device=dev, dtype=torch.float32)
+        else:
+            ortho = ortho.to(device=dev, dtype=torch.float32)
         total = (
-            cfg.lambda_nll * nll
-            + cfg.lambda_mse * mse
-            + cfg.lambda_agent * hetero.total
-            + cfg.lambda_orthogonality * ortho
-            + cfg.lambda_cov_penalty * cov_loss
-        )
+            float(cfg.lambda_nll) * nll
+            + float(cfg.lambda_mse) * mse
+            + float(cfg.lambda_agent) * hetero.total.to(device=dev, dtype=torch.float32)
+            + float(cfg.lambda_orthogonality) * ortho
+            + float(cfg.lambda_cov_penalty) * cov_loss
+        ).to(dtype=dt)
         return _Stage1Loss(
             specialist_nll=nll,
             specialist_mse=mse,

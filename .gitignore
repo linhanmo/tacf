@@ -57,6 +57,8 @@ logs/
 *.pth
 *.ckpt
 events.out.tfevents.*
+preprocess/
+dataset/
 
 # ---------- Project specific: figures / results ----------
 figures/
