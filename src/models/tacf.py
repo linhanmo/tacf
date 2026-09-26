@@ -15,7 +15,74 @@ from ..data.dataset import AGENT_NAMES
 from ..data.freq_decomp import DecomposerOutput, LearnableDecomposer
 
 
-__all__ = ["TACFOutput", "TACF"]
+__all__ = ["TACFOutput", "TACF", "_RevIN"]
+
+
+class _RevIN(nn.Module):
+    """Reversible Instance Normalization (RevIN, Kim et al. ICLR 2022).
+
+    Standard on all recent ETT-SOTA models (DLinear / iTransformer /
+    PatchTST / Bi-Mamba4TS / TEFN).  Subtracts per-channel, per-sample,
+    lookback-time mean/std and restores them on the output via denorm so
+    that magnitude/trend information never leaves the pipeline, even
+    when the backbone operates in z-score space.
+
+    Ported from Time-Series-Library/layers/StandardNorm.py so it stays
+    self-contained in src/ and doesn't depend on third-party imports.
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        eps: float = 1e-5,
+        affine: bool = True,
+        subtract_last: bool = False,
+    ) -> None:
+        super().__init__()
+        self.num_features = int(num_features)
+        self.eps = float(eps)
+        self.affine = bool(affine)
+        self.subtract_last = bool(subtract_last)
+        if self.affine:
+            self.affine_weight = nn.Parameter(torch.ones(self.num_features))
+            self.affine_bias = nn.Parameter(torch.zeros(self.num_features))
+        else:
+            self.register_parameter("affine_weight", None)
+            self.register_parameter("affine_bias", None)
+        self._last_mean: Optional[torch.Tensor] = None
+        self._last_stdev: Optional[torch.Tensor] = None
+        self._last_last_val: Optional[torch.Tensor] = None
+
+    def _get_statistics(self, x: torch.Tensor) -> None:
+        dim2reduce = tuple(range(1, x.ndim - 1))
+        if self.subtract_last:
+            self._last_last_val = x[:, -1:, :].detach()
+            self._last_mean = None
+        else:
+            self._last_mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
+        v = torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False)
+        self._last_stdev = torch.sqrt(v + self.eps).detach()
+
+    def norm(self, x: torch.Tensor) -> torch.Tensor:
+        self._get_statistics(x)
+        if self.subtract_last:
+            x = x - self._last_last_val
+        else:
+            x = x - self._last_mean
+        x = x / self._last_stdev
+        if self.affine:
+            x = x * self.affine_weight + self.affine_bias
+        return x
+
+    def denorm(self, x: torch.Tensor) -> torch.Tensor:
+        if self.affine:
+            x = (x - self.affine_bias) / (self.affine_weight + self.eps * self.eps)
+        x = x * self._last_stdev.to(x.device).to(x.dtype)
+        if self.subtract_last:
+            x = x + self._last_last_val.to(x.device).to(x.dtype)
+        else:
+            x = x + self._last_mean.to(x.device).to(x.dtype)
+        return x
 
 
 @dataclass
@@ -125,7 +192,22 @@ class TACF(nn.Module):
         aggregator_dropout: float = 0.05,
         aggregator_bidirectional: bool = True,
         # ---------- Sigma calibration (global multiplier, learnable scalar) ----
-        sigma_global_multiplier_init: float = 3.0,
+        sigma_global_multiplier_init: float = 1.0,
+        # ---------- SOTA-grade normalisation / residual shortcuts 2026-09-26 ----------
+        # RevIN (Reversible Instance Normalization) — DLinear / iTransformer /
+        # PatchTST / Bi-Mamba4TS all use per-sample instance norm on the time
+        # axis because ETT / weather / electricity series have strong non-stationary
+        # per-window distribution shifts (oil temperature jumps after maintenance,
+        # diurnal/weekly cycles not captured by the global StandardScaler).
+        use_revin: bool = True,
+        revin_affine: bool = True,
+        revin_subtract_last: bool = False,
+        # DLinear-style trend residual head — add a linear (2-layer MLP over last T
+        # timesteps of each instance-normalised channel directly to the final y_hat.
+        # DLinear takes ~MSE=0.44 on this exact setting (ETTh1 336→168) so
+        # giving TACF a dedicated linear trend shortcut avoids the MoA having
+        # to re-learn trivial linear extrapolation.
+        use_dlinear_trend_head: bool = True,
         # ---------- Misc ----------
         norm_eps: float = 1e-5,
     ) -> None:
@@ -138,6 +220,35 @@ class TACF(nn.Module):
         self.pred_len = int(pred_len)
         self.d_hidden = int(d_hidden)
         self._sigma_mult_init = float(sigma_global_multiplier_init)
+        self.use_revin = bool(use_revin)
+        self.use_dlinear_trend_head = bool(use_dlinear_trend_head)
+
+        # --- RevIN: per-sample reversible instance norm on the (B, T, D) input.
+        if self.use_revin:
+            self.revin = _RevIN(
+                num_features=self.in_channels,
+                eps=1e-5,
+                affine=bool(revin_affine),
+                subtract_last=bool(revin_subtract_last),
+            )
+        else:
+            self.revin = None
+
+        # --- DLinear-style direct trend shortcut.
+        if self.use_dlinear_trend_head:
+            # Simple T→P linear projection per channel (DLinear-individual style).
+            # Equivalent to fitting an AR(seq_len) per channel, residual on top of MoA.
+            # einsum "b t d, d p t -> b p d" contracts dim T:
+            #   out[b,p,d] = sum_t x_norm[b,t,d] * W[d,p,t] + b[d,p]
+            # So W.shape = (D, P, T).
+            self._trend_W = nn.Parameter(
+                torch.empty(self.out_channels, self.pred_len, self.seq_len)
+            )
+            self._trend_b = nn.Parameter(torch.zeros(self.out_channels, self.pred_len))
+            nn.init.kaiming_normal_(self._trend_W, nonlinearity="linear")
+        else:
+            self._trend_W = None
+            self._trend_b = None
 
         self.decomposer = LearnableDecomposer(
             in_channels=in_channels,
@@ -231,7 +342,42 @@ class TACF(nn.Module):
         -------
         :class:`TACFOutput` — fused ŷ/σ + α/r/eff_w + full auxiliary outputs.
         """
-        decomp = self.decomposer(x)
+        B, T, D_in = x.shape
+        # ---------------------------------------------------------------
+        # 2026-09-26: RevIN on input (DLinear / iTransformer SOTA style).
+        # Captures per-window distribution shift that the dataset-level
+        # StandardScaler misses (ETTh1 oil-temp maintenance jumps etc).
+        # ---------------------------------------------------------------
+        if self.use_revin:
+            x_norm = self.revin.norm(x)
+        else:
+            x_norm = x
+
+        # ---------------------------------------------------------------
+        # 2026-09-26: DLinear-style direct trend residual shortcut.
+        # Computed on the *normalised* input so initial MoA predictions
+        # are already anchored at the correct AR(seq_len) baseline, then
+        # MoA only has to predict the *residual* nonlinear pattern
+        # (seasonal, spike, regime change) on top.
+        # ---------------------------------------------------------------
+        if self.use_dlinear_trend_head:
+            # DLinear-individual-style per-channel T→P linear projection.
+            # For each sample b, channel d: pred[b,:,d] = x[b,:,d] @ W[d].T + b[d], where W[d] is (P,T).
+            # We do: (B, T, D) → (B, D, T) batch-wise matmul with W.T=(D, T, P) → (B, D, P) → (B, P, D).
+            B = x_norm.shape[0]
+            x_norm_bd = x_norm.transpose(1, 2)                          # (B, D, T)
+            w_dtp = self._trend_W.transpose(-1, -2)                      # (D, T, P)
+            # w_dtp.expand(B, D, T, P) would create (B, D, T, P); we want per-D matmul so use einsum
+            # (bmm can't broadcast D dim, so we reshape + permute back after contracting T)
+            # Alternative: loop over D or use matmul on (B,D,T) × (B,D,T,P)  — use einsum safely:
+            # "b d t, d t p -> b d p" contracts t over matching dims.
+            trend_bdp = torch.einsum("b d t, d t p -> b d p", x_norm_bd, w_dtp)   # (B, D, P)
+            # _trend_b shape: (D, P).  Need (1, P, D).
+            trend_pred = trend_bdp.transpose(1, 2) + self._trend_b.T.reshape(1, self.pred_len, self.out_channels)
+        else:
+            trend_pred = None
+
+        decomp = self.decomposer(x_norm)
         spec_out = self.specialists(decomp.as_dict(), x_stamp)
 
         mu_raw = spec_out.stack_mu()
@@ -247,26 +393,57 @@ class TACF(nn.Module):
         )
 
         # ---- Apply the learnable global sigma multiplier.
-        # Parameter is stored as a plain scalar (initialised to the user-supplied
-        # init value, typically 3.0).  We clamp it to a sensible positive range
-        # so early-stage instabilities can't blow sigma up, and then multiply
-        # sigma = sigma_aggregator * mult, clamp floor 1e-4 from head.
         mult = self.sigma_global_multiplier.clamp(min=0.2, max=20.0)
         sigma_scaled = (aggregator_out.sigma * mult).clamp(min=1e-4)
 
+        # ---- Add DLinear trend shortcut to aggregator output.
+        if trend_pred is not None:
+            y_hat_final = aggregator_out.y_hat + trend_pred
+        else:
+            y_hat_final = aggregator_out.y_hat
+
+        # ---------------------------------------------------------------
+        # 2026-09-26: RevIN denorm on output (y_hat and sigma both).
+        # Because sigma is a std, scaling by instance stdev recovers its
+        # physical units consistently with y_hat.
+        # ---------------------------------------------------------------
+        if self.use_revin:
+            y_hat_final = self.revin.denorm(y_hat_final)
+            sigma_scaled = self.revin.denorm(sigma_scaled)
+            # sigma is always positive; denorm may have added the mean
+            # component (because denorm is mean + stdev * z).  Subtract
+            # the mean shift that was meant for y_hat to keep sigma a
+            # pure scale.
+            _m_shift = getattr(self.revin, "_last_mean", None)
+            _use_last = getattr(self.revin, "subtract_last", False)
+            if _use_last:
+                _m_shift = getattr(self.revin, "_last_last_val", _m_shift)
+            if _m_shift is not None:
+                # broadcast _m_shift from (B,1,D) along P dim
+                sigma_scaled = sigma_scaled - _m_shift.to(sigma_scaled.device).to(sigma_scaled.dtype)
+            sigma_scaled = sigma_scaled.clamp(min=1e-4)
+
         aux_losses: Dict[str, torch.Tensor] = {}
-        aux_losses["orthogonality"] = self.decomposer.orthogonality_loss(x)
-        # Store sigma multiplier as a tensor-typed scalar for later logging.
-        # Do NOT multiply with sigma_scaled; just detach and reshape to () so
-        # downstream can `float()` it cleanly.
+        aux_losses["orthogonality"] = self.decomposer.orthogonality_loss(x_norm)
         aux_losses["sigma_multiplier"] = mult.detach().reshape(())
         if y is not None:
             with torch.no_grad():
-                se = (aggregator_out.y_hat - y).pow(2)
+                se = (y_hat_final - y).pow(2)
                 aux_losses["_mse_diag"] = se.mean()
+            if self.use_dlinear_trend_head:
+                # Diagnostics: how much does the linear shortcut contribute?
+                with torch.no_grad():
+                    tgt_normed = y
+                    if self.use_revin and getattr(self.revin, "_last_mean", None) is not None:
+                        # compare trend_head vs full on raw y scale by
+                        # computing MSE of trend-only on whatever space
+                        # we used to compute y_hat_final above — since
+                        # y_hat_final went through denorm, use denormed trend.
+                        trend_full = self.revin.denorm(trend_pred) if self.use_revin else trend_pred
+                        aux_losses["_mse_trend_only"] = (trend_full - y).pow(2).mean()
 
         return TACFOutput(
-            y_hat=aggregator_out.y_hat,
+            y_hat=y_hat_final,
             sigma=sigma_scaled,
             alpha=aggregator_out.alpha,
             reject=aggregator_out.reject,

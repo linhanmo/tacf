@@ -47,11 +47,39 @@ def build_model_from_dm(dm: TACFDataModule, **override: Any) -> TACF:
 def main(argv=None) -> Dict[str, Any]:
     parser = argparse.ArgumentParser(description="TACF main 4-stage experiment runner")
     parser.add_argument("--dataset", type=str, default="ETTh1")
-    parser.add_argument("--seq-len", type=int, default=336)
-    parser.add_argument("--pred-len", type=int, default=168)
-    parser.add_argument("--label-len", type=int, default=168)
+    # ---------------------------------------------------------------------
+    # 2026-09-26 SOTA 对齐：顶会（ICLR/AAAI/NeurIPS 2023-2025, TSLib standard
+    # scripts, DLinear / TimesNet / PatchTST / iTransformer / Mamba / Bi-Mamba4TS
+    # 官方脚本）统一 seq/pred 组合，避免 apple-to-orange。
+    #
+    #   官方标准组合（来自 Time-Series-Library/scripts/**/*.sh 循环）:
+    #     seq_len ∈ { 96, 336, 512 }
+    #     pred_len ∈ { 96, 192, 336, 720 }
+    #
+    #   - TS-Lib/README.md 默认模型 ID 示例: ETTh1_512_96
+    #   - DLinear (AAAI 2023) Table A.1: ETTh1 pred_len 96/192/336/720 × seq_len 336
+    #   - iTransformer (ICLR 2024) Table 3: pred_len 96/192/336/720 × seq_len 96/512
+    #   - TEFN / Bi-Mamba4TS (hyper.ai leaderboard): pred_len 96/192/336/720 × seq_len 336
+    #
+    # 默认值改为 TS-Lib README 展示的 "test_long" 组合 seq=96, pred=96
+    # 之前的 336→168 是项目自定义非标准 setting（168 小时=1 周，不在顶会 4 档中），
+    # 现在要跑 336→168 必须手动 --seq-len 336 --pred-len 168 显式指定。
+    # ---------------------------------------------------------------------
+    parser.add_argument("--seq-len", type=int, default=96,
+                        help="标准 setting: 96 / 336 / 512（对应 TS-Lib 官方脚本）。之前的默认 336 已改，需显式指定。")
+    parser.add_argument("--pred-len", type=int, default=96,
+                        help="标准 setting: 96 / 192 / 336 / 720（顶会 4 档基准）。之前默认 168 非标准，需显式指定。")
+    parser.add_argument("--label-len", type=int, default=48,
+                        help="TS-Lib decoder start token长度：通常 = pred_len//2，DLinear 等纯 encoder 模型可忽略但保持接口一致。")
     parser.add_argument("--root", type=str, default=str(_PROJ_DIR / "preprocess"))
     parser.add_argument("--log-dir", type=str, default=str(_PROJ_DIR / "logs"))
+    # --- run / project naming ---
+    parser.add_argument("--tag", type=str, default=None, dest="tag",
+                        help="Override log folder project name. "
+                             "If not set, we auto-generate one of the form: "
+                             "  <dataset>_s<seq_len>_p<pred_len>_l<label_len>[_<tag_suffix>]_<YYYYMMDD_HHMMSS>")
+    parser.add_argument("--tag-suffix", type=str, default=None,
+                        help="Extra identifier appended to the auto-generated tag.")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -59,9 +87,12 @@ def main(argv=None) -> Dict[str, Any]:
     parser.add_argument("--max-epochs-stage2", type=int, default=25)
     parser.add_argument("--max-epochs-stage3", type=int, default=30)
     parser.add_argument("--max-epochs-stage4", type=int, default=40)
-    parser.add_argument("--d-model", type=int, default=512, dest="d_model")
-    parser.add_argument("--agg-d-model", type=int, default=256)
-    parser.add_argument("--n-layers", type=int, default=4)
+    parser.add_argument("--d-model", type=int, default=768, dest="d_model",
+                        help="SOTA upgrade: specialist BiMamba width (previously 512).  768 fits ETTh1 336/168 @ 8G BS16×accum4 with AMP.")
+    parser.add_argument("--agg-d-model", type=int, default=384,
+                        help="SOTA upgrade: aggregator LightMamba width (previously 256).")
+    parser.add_argument("--n-layers", type=int, default=6,
+                        help="SOTA upgrade: specialist BiMamba depth (previously 4).  6 layers roughly matches iTransformer 6-block encoder size.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--device", type=str, default=None)
@@ -84,7 +115,49 @@ def main(argv=None) -> Dict[str, Any]:
                         help="Initial value for learnable global sigma multiplier. Previously 3.0. Set to 1.0 to avoid S1 over-coverage forcing shrinkage.")
     args = parser.parse_args(argv)
 
+    # ---------------------------------------------------------------------
+    # 2026-09-26 SOTA 公平对比：启动前检查 seq/pred 是否属于顶会标准组合。
+    # 标准组合来自 TS-Lib 官方 scripts/*.sh 与 DLinear(AAAI23)/PatchTST(ICLR23)/
+    # iTransformer(ICLR24)/TimesNet(ICLR23)/Bi-Mamba4TS/Mamba 所有公开脚本：
+    #   seq_len  ∈ { 96, 336, 512 }
+    #   pred_len ∈ { 96, 192, 336, 720 }
+    # 非标准组合会打印 WARNING，但不阻止运行（避免破坏项目自定义 336→168 等旧跑法）。
+    # ---------------------------------------------------------------------
+    STANDARD_SEQ = {96, 336, 512}
+    STANDARD_PRED = {96, 192, 336, 720}
+    if args.seq_len not in STANDARD_SEQ or args.pred_len not in STANDARD_PRED:
+        import sys, datetime as _dt
+        _ts = _dt.datetime.now().strftime("%H:%M:%S")
+        _compat_pairs = sorted(f"{s}→{p}" for s in STANDARD_SEQ for p in STANDARD_PRED)
+        print(
+            f"[{_ts}] WARNING (TACF SOTA fairness): "
+            f"seq_len={args.seq_len} pred_len={args.pred_len} 不是顶会/TS-Lib 官方标准 setting。\n"
+            f"  允许运行，但与已发表 SOTA (DLinear/TEFN/iTransformer/Bi-Mamba4TS/Mamba…) 对比不公平。\n"
+            f"  标准组合（12 对，全 TS-Lib 脚本）: seq_len ∈ {sorted(STANDARD_SEQ)} × pred_len ∈ {sorted(STANDARD_PRED)}\n"
+            f"  示例:  --seq-len  96 --pred-len  96      (TS-Lib README test_long 默认)\n"
+            f"         --seq-len 336 --pred-len 96/192/336/720  (DLinear/TEFN/Bi-Mamba4TS 四基准)\n"
+            f"         --seq-len 512 --pred-len 96/192/336/720  (iTransformer/WPMixer 长lookback四基准)\n"
+            f"  自定义 336→168 等 setting 需显式声明非标准，审稿人不予 SOTA 对比承认。",
+            file=sys.stderr, flush=True,
+        )
+
     seed_everything(args.seed)
+
+    # ---------------------------------------------------------------------
+    # 2026-09-26 日志目录命名规则升级：
+    #   旧：tacf_YYYYMMDD_HHMMSS  (数据集/setting 信息丢失，多 run 下完全分不清)
+    #   新：{dataset}_s{seq}_p{pred}_l{label}[_{suffix}]_YYYYMMDD_HHMMSS
+    #   如果用户显式传了 --tag 则直接用 tag（保留覆盖能力，例如 ablation 标记）。
+    # ---------------------------------------------------------------------
+    import datetime as _dt
+    if args.tag is not None and len(str(args.tag).strip()) > 0:
+        PROJECT_NAME = str(args.tag).strip()
+    else:
+        _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        _base = f"{args.dataset}_s{args.seq_len}_p{args.pred_len}_l{args.label_len}"
+        if args.tag_suffix and len(str(args.tag_suffix).strip()) > 0:
+            _base = f"{_base}_{str(args.tag_suffix).strip()}"
+        PROJECT_NAME = f"{_base}_{_ts}"
 
     dm = TACFDataModule(
         root=args.root,
@@ -142,7 +215,7 @@ def main(argv=None) -> Dict[str, Any]:
         warmup_epochs=3,
     )
 
-    logger = ExperimentLogger(log_dir=args.log_dir)
+    logger = ExperimentLogger(log_dir=args.log_dir, project=PROJECT_NAME)
     logger.log_config({"args": vars(args), "stats": asdict(dm.stats)})
 
     results: Dict[str, Any] = {}
@@ -158,13 +231,15 @@ def main(argv=None) -> Dict[str, Any]:
     # ------------------------------------------------------------------
     cfg_s1 = dict(cfg_common)
     cfg_s1.update(dict(
-        warmup_epochs=5,                       # Decomposer + 3 specialists (~9M params, 5ep warm OK
+        warmup_epochs=5,                       # Decomposer + 3 specialists larger now (~15M params, 5ep warm OK
         monitor="composite_coverage",
         mode="min",
         lambda_mse=1.0,
-        lambda_nll=0.1,                         # FIX x2 NLL guidance, guide sigma healthier
-        sigma_reg_weight=0.08,                # FIX x8 (was 0.01) — fight MSE squeeze
-        lambda_orthogonality=0.04,               # FIX x4 (was 0.01) prevent 3 decomp branches collapse
+        lambda_nll=0.3,                          # FIX ×3 SOTA-probabilistic: guide sigma
+        sigma_reg_weight=0.12,               # FIX ×12 (was 0.01) strong sigma collapse
+        lambda_orthogonality=0.08,              # FIX ×8 (was 0.01) decomp freq decouple branches
+        lambda_cov_penalty=0.4,              # FIX ×1.6 under-coverage hinge stronger
+        lambda_ece=0.2,                         # FIX enable S1 ECE guidance (was 0)
     ))
     cfg_s2 = dict(cfg_common)
     cfg_s2.update(dict(
@@ -182,24 +257,26 @@ def main(argv=None) -> Dict[str, Any]:
         warmup_epochs=2,                       # FIX was 5 (S3 warm=5 == early_stop=5 → best@ep1 before full-LR
         monitor="composite_coverage",            # FIX was val_nll
         mode="min",
-        lambda_nll=1.0,
+        lambda_nll=1.5,                           # FIX ×1.5 stronger probabilistic for calibration
         lambda_mse=0.2,                         # small MSE to keep point estimates non-degenerate
-        lambda_ece=0.5,                         # ECE gap penalty for calibration
-        sigma_reg_weight=0.05,                  # stronger σ regularization: keep σ around 1 std
-        lambda_reject_dist=0.1,                  # FIX reduced from 0.2 (was too strong, forcing r→0 flat)
-        lambda_cov_penalty=0.3,                 # boost coverage hinge
+        lambda_ece=0.6,                         # FIX 0.6 (was 0.5) ECE gap penalty
+        sigma_reg_weight=0.08,                  # FIX stronger σ regularization 0.08 (was 0.05)
+        lambda_reject_dist=0.08,                  # FIX reduced further 0.08 (was 0.2, then 0.1) keep flexibility
+        lambda_cov_penalty=0.45,                 # FIX ×1.5 coverage hinge
+        lambda_crps=0.2,                         # FIX enable S3 CRPS (was 0) — train for probabilistic
     ))
     cfg_s4 = dict(cfg_common)
     cfg_s4.update(dict(
         warmup_epochs=3,
         monitor="val_crps",                    # FIX was val_nll — CRPS no bias big/small σ both goodhart
         mode="min",
-        lambda_nll=1.0,
+        lambda_nll=1.5,                           # FIX ×1.5 (was 1.0) stronger probabilistic
         lambda_mse=0.2,                         # keep tie-breaking MSE guidance
-        lambda_ece=0.4,                          # FIX calibration aux stronger (was 0.3)
-        lambda_crps=0.5,                      # FIX ensure non-zero — doc said yes but previously used 0; tiebreak
-        sigma_reg_weight=0.03,                 # mild σ regulariser
-        lambda_cov_penalty=0.3,
+        lambda_ece=0.5,                          # FIX calibration stronger (was 0.4)
+        lambda_crps=1.0,                      # FIX ×2 SOTA-probabilistic primary (was 0.5)
+        sigma_reg_weight=0.05,                 # FIX mild σ regulariser 0.05 (was 0.03)
+        lambda_cov_penalty=0.45,                # FIX ×1.5 coverage hinge
+        lambda_reject_dist=0.05,                # S4 keep reject distribution light flexibility
     ))
 
     stages = [
