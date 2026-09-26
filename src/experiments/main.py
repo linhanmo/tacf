@@ -113,6 +113,16 @@ def main(argv=None) -> Dict[str, Any]:
     parser.add_argument("--sigma-global-multiplier-init", type=float, default=1.0,
                         dest="sigma_global_multiplier_init",
                         help="Initial value for learnable global sigma multiplier. Previously 3.0. Set to 1.0 to avoid S1 over-coverage forcing shrinkage.")
+    # ------------------------------------------------------------------ SOTA 架构开关
+    #  对应 src/models/tacf.py TACF.__init__ 的 use_revin / use_dlinear_trend_head 两个 hyperparam。
+    #  scaled_runs.sh SOTA_FLAGS 默认 --use-revin --use-dlinear-trend-head 打开。
+    #  关闭分别传 --no-use-revin / --no-use-dlinear-trend-head。
+    parser.add_argument("--use-revin", action="store_true", default=True, dest="use_revin",
+                        help="RevIN reversible instance norm ON (DLinear/iTransformer/Bi-Mamba4TS 标配). 默认 ON；关闭传 --no-use-revin。")
+    parser.add_argument("--no-use-revin", action="store_false", dest="use_revin")
+    parser.add_argument("--use-dlinear-trend-head", action="store_true", default=True, dest="use_dlinear_trend_head",
+                        help="DLinear-individual style per-channel linear trend residual shortcut ON. 默认 ON；关闭传 --no-use-dlinear-trend-head。")
+    parser.add_argument("--no-use-dlinear-trend-head", action="store_false", dest="use_dlinear_trend_head")
     args = parser.parse_args(argv)
 
     # ---------------------------------------------------------------------
@@ -181,6 +191,8 @@ def main(argv=None) -> Dict[str, Any]:
         specialist_n_layers=args.n_layers,
         aggregator_d_model=args.agg_d_model,
         sigma_global_multiplier_init=sigma_mult_init,
+        use_revin=bool(getattr(args, "use_revin", True)),
+        use_dlinear_trend_head=bool(getattr(args, "use_dlinear_trend_head", True)),
     )
     model = build_model_from_dm(dm, **model_override)
     print(model)
