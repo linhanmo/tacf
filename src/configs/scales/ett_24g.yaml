@@ -1,0 +1,67 @@
+# ETT Family (ETTh1/ETTh2/ETTm1/ETTm2) - 24GB GPU PRODUCTION preset.
+# ---------------------------------------------------------------------
+# MODEL ARCHITECTURE LOCKED (d_model, n_layers) PER USER INSTRUCTION.
+# ONLY physical_batch_size × grad_accum_steps are tuned for 24GB headroom.
+# ---------------------------------------------------------------------
+# d_model   = 512   (unchanged from 24G reference preset)
+# n_layers  = 4     (unchanged)
+# agg d_m   = 256   (unchanged)
+# agg n_l   = 2     (unchanged)
+# ---------------------------------------------------------------------
+# BS_physical = 16   (peak activation VRAM ~(16/28)*12.76 = ~7.3GB AMP @ 24G safe)
+# accum_steps = 4
+# BS_effective = 16 × 4 = 64  → large-batch BN & gradient quality, ~1/4 VRAM of BS64 no-accum.
+# ---------------------------------------------------------------------
+
+project:
+  name: tacf_ett_24g
+  seed: 42
+  device: cuda
+  amp: true
+
+data:
+  dataset: ETTh1
+  root: preprocess
+  seq_len: 336
+  pred_len: 168
+  label_len: 168
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+  use_time_features: true
+
+model:
+  specialist:
+    d_model: 512
+    n_layers: 4
+  aggregator:
+    d_model: 256
+    n_layers: 2
+
+training:
+  lr: 1.0e-3
+  weight_decay: 1e-4
+  grad_clip: 1.0
+  warmup_epochs: 5
+  grad_accum_steps: 4
+  stage1_max_epochs: 40
+  stage2_max_epochs: 15
+  stage3_max_epochs: 15
+  stage4_max_epochs: 30
+  early_stop_stage1: 15
+  early_stop_stage2: 6
+  early_stop_stage3: 6
+  early_stop_stage4: 8
+  stage4_lr_mult: 0.03
+  stage4_early_stop: 5
+
+loss:
+  lambda_nll: 2.0
+  lambda_mse: 1.0
+  lambda_consensus: 0.1
+  lambda_reject: 0.01
+  lambda_orthogonality: 0.01
+  lambda_agent: 0.05
+  lambda_cov_penalty: 0.25
+  target_q: 0.95
+  use_mixture_nll: false
