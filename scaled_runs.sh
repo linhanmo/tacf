@@ -46,7 +46,11 @@ die() { echo "ERROR: $*" >&2 ; exit 2 ; }
 DATASET=""
 MULTI_MODE=""            # "all" | "list" | "" (single)
 DATASETS_LIST=""
+RUN_MODE="single"        # v4 new: single | full
+                        #   - single: 1 dataset × 1 setting (seq_len × pred_len)
+                        #   - full  : 1 dataset × 12 standard settings = 3×seq × 4×pred = {96,336,512} × {96,192,336,720}
 CONTINUE_ON_FAIL=0
+RERUN=0                  # default: resume, skip runs marked .DONE; --rerun 强制重跑
 TAG_SUFFIX=""
 NO_VRAM_CHECK=0
 FORCE_TRAFFIC=0
@@ -66,6 +70,12 @@ LABEL_LEN=""
 #   ETTh1/2=7, ETTm1/2=7, exchange=8, weather=21, electricity=321, traffic=862(excl)
 ALL_7_DATASETS="ETTh1 ETTh2 ETTm1 ETTm2 exchange_rate weather electricity"
 LOG_ROOT="${SCRIPT_DIR}/logs"
+# Full-mode 12 个标准组合（TS-Lib 官方全集，顶会 Table 1-3 全可对比）：
+#   seq_len  ∈ { 96, 336, 512 }
+#   pred_len ∈ { 96, 192, 336, 720 }
+# 排序：先 seq 升、后 pred 升（96→96, 96→192, 96→336, 96→720, 336→96, ... 512→720）
+FULL_SEQS="96 336 512"
+FULL_PREDS="96 192 336 720"
 
 # ---------------------------------------------------------------- parser
 usage() {
@@ -75,30 +85,40 @@ usage() {
   awk 'NR>=3 && NR<=60 && /^#/ { sub("^# ?",""); print }' "${BASH_SOURCE[0]}"
   cat <<'EOF'
 
-Script options (SINGLE-dataset mode OR MULTI-dataset mode, pick one):
+Script options:  run modes (pick exactly one of: --dataset X | --all | --datasets "...")
   Single-dataset (classic):
     --dataset <DS>             ETTh1|ETTh2|ETTm1|ETTm2|weather|electricity|exchange_rate|traffic
+                                 + 默认 配 --mode single: DS 只跑 1 个 setting (seq_len × pred_len)
+                                 + 配 --mode full:   DS 循环 12 个标准 setting = {96,336,512} × {96,192,336,720}
+                                                     中途 Ctrl+C 随时停；下次重传 SAME cli 自动 resume 跳过已完成的 run。
 
   Multi-dataset (either, not both):
     --all                      Run all 7 standard datasets in D-asc order:
                                  ETTh1 ETTh2 ETTm1 ETTm2 exchange_rate weather electricity
+                               (配 --mode single: 7×1=7 run；配 --mode full: 7×12=84 run)
                                (traffic excluded; use --force-traffic --dataset traffic to run it)
-    --datasets "DS1 DS2 ..."   Run a user-defined list of datasets (same ordering as given).
+    --datasets "DS1 DS2 ..."   Run a user-defined list of datasets (--mode single/full 同上).
 
-  Common:
+  Run-mode flag (applies to all datasets):
+    --mode single|full         【NEW】single=1 setting per DS (默认); full=12 顶会标准组合 per DS.
+                               建议：想随时可续跑请配 --mode full，哪怕单个 dataset。
+
+  Common / setting flags:
     --gpu-tier <24G|8G>        (必填) GPU 显存等级（两档锁模型，唯 BS×accum 调）
-    --seq-len  <96|336|512>    标准 lookback，默认 336（SOTA 最常用）
-    --pred-len <96|192|336|720> 标准 horizon，默认 96（SOTA 最常用基准档）
+    --seq-len  <96|336|512>    single-mode lookback；full-mode 覆盖 FULL_SEQS，传了会 WARNING 忽略
+    --pred-len <96|192|336|720> single-mode horizon；full-mode 覆盖 FULL_PREDS，传了会 WARNING 忽略
     --label-len <N>            decoder start token，默认 pred_len//2（TS-Lib 惯例）
 
+  Execution flags:
     --no-vram-check            跳过 estimate_vram_fast.py VRAM 预检
     --force-traffic            traffic 默认不推荐，传此 flag 才放行
-    --allow-nonstandard-setting  允许 seq/pred 非顶会标准 12 对（会触发 main.py stderr WARNING）
+    --allow-nonstandard-setting  single-mode: 允许 seq/pred 非顶会标准 12 对（会触发 main.py stderr WARNING）
     --no-sota-flags            关闭 RevIN / DLinear-trend-head / σ_init=1.0 等 SOTA 升级
-    --dry-run                  只打印 main.py 命令，不执行（用于参数审查）；多数据集模式下打印所有 run。
-    --continue-on-fail         多数据集模式：某个 dataset 失败，继续跑下一个。默认: 第一个失败立即停。
+    --dry-run                  只打印 main.py 命令，不执行（用于参数审查）；full-mode 下打印所有 12/84 run。
+    --continue-on-fail         某个 run 失败，继续下一个。默认: 首个失败即停 (写 ABORTED 到 summary)。
+    --rerun                    默认 resume：batch dir 里已写 <key>.DONE 的 run 会 SKIP。传 --rerun 强制重跑全部。
     --extra '...'              额外透传给 src.experiments.main 的参数（所有子 run 共用）
-    --tag-suffix '...'         透传给 main.py --tag-suffix，所有子 run 共用（区分 ablation/seeds）
+    --tag-suffix '...'         透传给 main.py --tag-suffix，所有子 run 共用（区分 ablation/seeds；也作为 resume batch key 的一部分）
     --py <bin>                 Python 解释器，默认 $PYTHON 或 python
     -h / --help                Show this help
 EOF
@@ -110,6 +130,11 @@ while [[ $# -gt 0 ]]; do
     --dataset)                   DATASET="$2"; shift 2 ;;
     --all)                       MULTI_MODE="all"; shift ;;
     --datasets)                  MULTI_MODE="list"; DATASETS_LIST="$2"; shift 2 ;;
+    --mode)
+      case "$2" in
+        single|full) RUN_MODE="$2" ;;
+        *) die "--mode 只能是 single 或 full，收到 $2" ;;
+      esac; shift 2 ;;
     --gpu-tier)                  GPU_TIER="$2"; shift 2 ;;
     --seq-len)                   SEQ_LEN="$2"; shift 2 ;;
     --pred-len)                  PRED_LEN="$2"; shift 2 ;;
@@ -120,6 +145,7 @@ while [[ $# -gt 0 ]]; do
     --no-sota-flags)             NO_SOTA_FLAGS=1; shift ;;
     --dry-run)                   DRY_RUN=1; shift ;;
     --continue-on-fail)          CONTINUE_ON_FAIL=1; shift ;;
+    --rerun)                     RERUN=1; shift ;;
     --extra)                     EXTRA_ARGS="$2"; shift 2 ;;
     --tag-suffix)                TAG_SUFFIX="$2"; shift 2 ;;
     --run-tag-suffix)            TAG_SUFFIX="$2"; shift 2 ;;   # alias
@@ -132,7 +158,14 @@ done
 [[ -n "$GPU_TIER"  ]] || die "--gpu-tier 未传。仅支持: 24G, 8G"
 [[ "$GPU_TIER" == "24G" || "$GPU_TIER" == "8G" ]] || die "--gpu-tier 当前只支持 24G 或 8G (去掉中间档，d_model/layers 锁死只改 grad_accum)"
 
-# --- MULTI mode entrypoint ------------------------------------------------
+# full-mode 下，如果用户硬传了 --seq-len/--pred-len，语义冲突（full=自动循环 12 种），发出 WARNING 覆盖为 FULL_SEQS/PREDS
+if [[ "$RUN_MODE" == "full" ]]; then
+  if [[ -n "$SEQ_LEN" || -n "$PRED_LEN" ]]; then
+    echo "[WARNING --mode full] --seq-len / --pred-len 被忽略（full-mode 自动循环 FULL_SEQS $FULL_SEQS × FULL_PREDS $FULL_PREDS 共 12 setting）。" >&2
+    SEQ_LEN=""; PRED_LEN=""
+  fi
+fi
+
 if [[ "$MULTI_MODE" == "all" || "$MULTI_MODE" == "list" ]]; then
   if [[ -n "$DATASET" ]]; then
     die "multi dataset mode (--all / --datasets) 与 --dataset 互斥，只能二选一。"
@@ -146,52 +179,72 @@ if [[ "$MULTI_MODE" == "all" || "$MULTI_MODE" == "list" ]]; then
     die "--datasets 列表为空。"
   fi
 
-  # 批 run summary 目录
-  BATCH_TS=$(date +%Y%m%d_%H%M%S)
-  BATCH_DIR="${LOG_ROOT}/all_runs_${BATCH_TS}"
-  mkdir -p "${BATCH_DIR}"
+  # 批 run summary 目录（断点续跑关键：不随时间戳新建，而是固定 key 目录）
+  #   key = all_runs_{MODE}_{RUN_MODE}_{GPU_TIER}[_{TAG_SUFFIX}]
+  #   这样：
+  #     1) 同一条命令重启（例如 Ctrl+C 后 re-run 同命令）自动复用同一 BATCH_DIR
+  #     2) BATCH_DIR/done/<run_key>.DONE 存在则 skip（除非 --rerun）
+  #     3) 改 CLI 参数（例如 --tag-suffix、加 --datasets 子集）→ 新建独立 BATCH_DIR，不互相踩
+  if [[ -n "$TAG_SUFFIX" ]]; then
+    SUFFIX_KEY="_${TAG_SUFFIX}"
+  else
+    SUFFIX_KEY=""
+  fi
+  BATCH_DIR_NAME="all_runs_${MULTI_MODE}_${RUN_MODE}_${GPU_TIER}${SUFFIX_KEY}"
+  BATCH_DIR="${LOG_ROOT}/${BATCH_DIR_NAME}"
+  DONE_DIR="${BATCH_DIR}/done"
+  mkdir -p "${BATCH_DIR}" "${DONE_DIR}"
   SUMMARY_JSON="${BATCH_DIR}/summary.json"
-
-  echo "================================================================="
-  echo " TACF multi-dataset BATCH RUN  (${#DS_ARRAY[@]} datasets)"
-  echo "   mode     : ${MULTI_MODE}"
-  echo "   datasets : ${DS_ARRAY[*]}"
-  echo "   tier     : ${GPU_TIER}"
-  echo "   setting  : seq=${SEQ_LEN_DEF} pred=${PRED_LEN_DEF} (per-run CLI 覆盖生效)"
-  echo "   tag-suf  : ${TAG_SUFFIX:-<none>}"
-  echo "   extra    : ${EXTRA_ARGS:-<none>}"
-  echo "   continue : $([[ $CONTINUE_ON_FAIL -eq 1 ]] && echo 'ON (失败继续)' || echo 'OFF (首个失败即停)')"
-  echo "   batch dir: ${BATCH_DIR}"
-  echo "================================================================="
-
-  # 先把 summary header 写好
-  cat >"$SUMMARY_JSON" <<EOF
+  if [[ ! -f "$SUMMARY_JSON" ]]; then
+    # 首次新建 summary
+    cat >"$SUMMARY_JSON" <<EOF
 {
-  "batch_ts": "${BATCH_TS}",
+  "batch_dir": "${BATCH_DIR_NAME}",
   "gpu_tier": "${GPU_TIER}",
   "multi_mode": "${MULTI_MODE}",
+  "run_mode": "${RUN_MODE}",
   "datasets": $(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${DS_ARRAY[@]}"),
-  "seq_len_default": ${SEQ_LEN_DEF},
-  "pred_len_default": ${PRED_LEN_DEF},
   "tag_suffix": $(python3 -c 'import json,sys; print(json.dumps(sys.argv[1] if len(sys.argv)>1 else None))' "$TAG_SUFFIX"),
   "run_order": [],
   "runs": {}
 }
 EOF
+  fi
+
+  echo "================================================================="
+  echo " TACF multi-dataset BATCH RUN  (${#DS_ARRAY[@]} datasets)  run_mode=${RUN_MODE}"
+  echo "   mode     : ${MULTI_MODE}"
+  echo "   run_mode : ${RUN_MODE}  (single=1 setting/DS, full=12 settings/DS)"
+  echo "   datasets : ${DS_ARRAY[*]}"
+  echo "   tier     : ${GPU_TIER}"
+  echo "   setting  : seq=${SEQ_LEN_DEF} pred=${PRED_LEN_DEF} (per-run CLI 覆盖生效)"
+  echo "   tag-suf  : ${TAG_SUFFIX:-<none>}"
+  echo "   extra    : ${EXTRA_ARGS:-<none>}"
+  echo "   rerun    : $([[ $RERUN -eq 1 ]] && echo 'FORCE RE-RUN（删 done/*.DONE 重跑全部）' || echo 'RESUME 默认：已有 DONE 标记的 run SKIP')"
+  echo "   continue : $([[ $CONTINUE_ON_FAIL -eq 1 ]] && echo 'ON (失败继续)' || echo 'OFF (首个失败即停)')"
+  echo "   batch dir: ${BATCH_DIR}"
+  [[ "$RUN_MODE" == "full" ]] && \
+  echo "   total runs: ${#DS_ARRAY[@]} datasets × 12 settings = $(( ${#DS_ARRAY[@]} * 12 )) runs" || \
+  echo "   total runs: ${#DS_ARRAY[@]} datasets × 1 setting  = ${#DS_ARRAY[@]} runs"
+  echo "   [断点续跑] 重跑同一条命令 = 自动跳过已有 DONE 标记的 run；清缓存 rm -rf ${DONE_DIR}/* 或传 --rerun"
+  echo "================================================================="
+
+  if [[ $RERUN -eq 1 ]]; then
+    echo "[--rerun] 清理已有 DONE 标记：${DONE_DIR}/*.DONE"
+    rm -f "${DONE_DIR}"/*.DONE 2>/dev/null || true
+  fi
 
   EXIT_TOTAL=0
-  RUN_IDX=0
+  DS_RUN_IDX=0
   for DS in "${DS_ARRAY[@]}"; do
-    RUN_IDX=$((RUN_IDX+1))
-    RUN_ID=$(printf "%02d_%s" "$RUN_IDX" "$DS")
+    DS_RUN_IDX=$((DS_RUN_IDX+1))
     echo
     echo "#################################################################"
-    echo " #${RUN_IDX}/${#DS_ARRAY[@]}  START  dataset=${DS}"
+    echo " #${DS_RUN_IDX}/${#DS_ARRAY[@]}  START  dataset=${DS}"
     echo "#################################################################"
     # 启动脚本本身（递归），把除 --all/--datasets 以外的参数原样透传；
-    # 子进程通过 --dataset "$DS" 指定单 dataset mode。
-    # 子进程的 stdout/stderr 继承当前进程（直接看）。
-    SUB_ARGS=( --dataset "$DS" --gpu-tier "$GPU_TIER" )
+    # 新增 --_batch-dir "${BATCH_DIR}" 让 SINGLE 子进程知道 DONE 标记写到哪里。
+    SUB_ARGS=( --dataset "$DS" --gpu-tier "$GPU_TIER" --mode "$RUN_MODE" )
     [[ -n "$SEQ_LEN"       ]] && SUB_ARGS+=( --seq-len       "$SEQ_LEN" )
     [[ -n "$PRED_LEN"      ]] && SUB_ARGS+=( --pred-len      "$PRED_LEN" )
     [[ -n "$LABEL_LEN"     ]] && SUB_ARGS+=( --label-len     "$LABEL_LEN" )
@@ -200,9 +253,13 @@ EOF
     [[ $ALLOW_NONSTANDARD  -eq 1 ]] && SUB_ARGS+=( --allow-nonstandard-setting )
     [[ $NO_SOTA_FLAGS      -eq 1 ]] && SUB_ARGS+=( --no-sota-flags )
     [[ $DRY_RUN            -eq 1 ]] && SUB_ARGS+=( --dry-run )
+    [[ $CONTINUE_ON_FAIL   -eq 1 ]] && SUB_ARGS+=( --continue-on-fail )
+    [[ $RERUN              -eq 1 ]] && SUB_ARGS+=( --rerun )
     [[ -n "$EXTRA_ARGS"    ]] && SUB_ARGS+=( --extra "$EXTRA_ARGS" )
     [[ -n "$TAG_SUFFIX"    ]] && SUB_ARGS+=( --tag-suffix "$TAG_SUFFIX" )
     [[ -n "${PY:-}"        ]] && SUB_ARGS+=( --py "$PY" )
+    # 把 BATCH_DIR 传给子进程（让子进程把 <ds_s_p_l>.DONE 写到批目录里而不是自己的临时目录）
+    SUB_ARGS+=( --_batch-dir "${BATCH_DIR}" )
     set +e
     if [[ $DRY_RUN -eq 1 ]]; then
       echo "[dry-run][$DS] 子命令: bash $0 ${SUB_ARGS[*]}"
@@ -251,18 +308,213 @@ PY
   echo "================================================================="
   echo " 多数据集批跑完成：成功=$(( ${#DS_ARRAY[@]} - EXIT_TOTAL ))/ 失败=${EXIT_TOTAL} 共 ${#DS_ARRAY[@]}"
   echo " summary: ${SUMMARY_JSON}"
+  echo " 断点续跑提示：再次运行 SAME CLI = 自动跳过已 <done/*DONE> 的 run；传 --rerun 清所有 DONE 从头来"
   echo "================================================================="
   exit $EXIT_TOTAL
 fi
 # --- END MULTI mode entrypoint; continue to SINGLE-dataset mode below -----
 
+# =========================================================================
+# SINGLE (1 dataset) 或 FULL (1 dataset × 12 settings) 模式
+# =========================================================================
+# 设计：
+#   --dataset X --mode single  → 只跑 1 setting：用户传 seq_len/pred_len；如果没传 = 336×96
+#   --dataset X --mode full    → 循环 12 setting（FULL_SEQS × FULL_PREDS，已定义）
+#                                中途 Ctrl+C，下次 SAME CLI 自动跳过已写 DONE 标记的 setting
+#
+# --_batch-dir <dir>：MULTI 进程传给子进程，把 DONE/summary 写到同一个批目录。
+#   若用户直接跑单 dataset（非 MULTI 递归），--_batch-dir 未传，则自动建：
+#       logs/one_ds_{DS}_{RUN_MODE}_{GPU_TIER}[_{TAG_SUFFIX}]
+_BATCH_DIR=""
+RUN_EXIT_TOTAL=0
+
+# --- 额外内部 flag（MULTI 子进程透传的，用户不应该用，所以 hide 掉）---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --_batch-dir) _BATCH_DIR="$2"; shift 2 ;;
+    *) shift ;;  # 其它参数已经解析过了，丢掉
+  esac
+done
+
 [[ -n "$DATASET"   ]] || die "请传 --dataset <DS> 或 --all / --datasets \"DS1 DS2 ...\"。支持: $ALL_7_DATASETS traffic"
 
-SEQ_LEN="${SEQ_LEN:-$SEQ_LEN_DEF}"
-PRED_LEN="${PRED_LEN:-$PRED_LEN_DEF}"
-# label_len 惯例：TS-Lib Autoformer/PatchTST 都用 label_len = pred_len//2；
-# DLinear/iTransformer 等纯 encoder 模型不使用此参数，但保持此惯例兼容性更好。
-LABEL_LEN="${LABEL_LEN:-$(( PRED_LEN / 2 ))}"
+# SINGLE/FULL 模式的批目录（one_ds_*，或 MULTI 传进来的 BATCH_DIR）
+if [[ -z "$_BATCH_DIR" ]]; then
+  if [[ -n "$TAG_SUFFIX" ]]; then SUFFIX_KEY="_${TAG_SUFFIX}"; else SUFFIX_KEY=""; fi
+  ONE_BATCH_DIR_NAME="one_ds_${DATASET}_${RUN_MODE}_${GPU_TIER}${SUFFIX_KEY}"
+  _BATCH_DIR="${LOG_ROOT}/${ONE_BATCH_DIR_NAME}"
+fi
+_DONE_DIR="${_BATCH_DIR}/done"
+mkdir -p "${_BATCH_DIR}" "${_DONE_DIR}"
+_ONE_SUMMARY="${_BATCH_DIR}/summary_one.json"
+if [[ ! -f "$_ONE_SUMMARY" ]]; then
+  cat >"$_ONE_SUMMARY" <<EOF
+{
+  "dataset": "${DATASET}",
+  "gpu_tier": "${GPU_TIER}",
+  "run_mode": "${RUN_MODE}",
+  "tag_suffix": $(python3 -c 'import json,sys; print(json.dumps(sys.argv[1] if len(sys.argv)>1 else None))' "$TAG_SUFFIX"),
+  "run_order": [],
+  "runs": {}
+}
+EOF
+fi
+
+echo
+echo "================================================================="
+echo " [batch dir: ${_BATCH_DIR}]"
+echo " dataset=${DATASET}  run_mode=${RUN_MODE}  tier=${GPU_TIER}"
+echo " resume default: SKIP <done/*.DONE> 已存在的 run (传 --rerun 强制重跑)"
+[[ "$RUN_MODE" == "full" ]] && echo " full settings: FULL_SEQS=$FULL_SEQS  FULL_PREDS=$FULL_PREDS  (12 runs/DS)"
+[[ "$RUN_MODE" == "single" ]] && echo " single setting: seq=${SEQ_LEN_DEF} pred=${PRED_LEN_DEF} (用户 CLI 覆盖优先)"
+echo "================================================================="
+
+if [[ $RERUN -eq 1 ]]; then
+  echo "[--rerun] 清理已有 DONE 标记：${_DONE_DIR}/*.DONE"
+  rm -f "${_DONE_DIR}"/*.DONE 2>/dev/null || true
+fi
+
+# 构造 RUN_JOBS 数组（每个元素 = "S:SEQ_LEN:PRED_LEN:LABEL_LEN"）
+declare -a RUN_JOBS=()
+if [[ "$RUN_MODE" == "single" ]]; then
+  _S="${SEQ_LEN:-$SEQ_LEN_DEF}"
+  _P="${PRED_LEN:-$PRED_LEN_DEF}"
+  _L="${LABEL_LEN:-$(( _P / 2 ))}"
+  RUN_JOBS+=( "S:${_S}:${_P}:${_L}" )
+else
+  for _S in $FULL_SEQS; do
+    for _P in $FULL_PREDS; do
+      _L="${LABEL_LEN:-$(( _P / 2 ))}"
+      RUN_JOBS+=( "S:${_S}:${_P}:${_L}" )
+    done
+  done
+fi
+
+echo
+echo ">>>>>> 本 dataset 待跑 run 数: ${#RUN_JOBS[@]}（Ctrl+C 可中断；重传 SAME CLI = 自动 resume 跳过 DONE）"
+echo
+
+RUNC=0
+for JOB in "${RUN_JOBS[@]}"; do
+  IFS=':' read -r _T _S _P _L <<<"$JOB"
+  RUNC=$((RUNC+1))
+  # 关键：run 的唯一 KEY = {dataset}_s{S}_p{P}_l{L}[_{TAG_SUFFIX}]
+  #   FULL 模式下每个 setting 一个唯一 key；中断后重跑精确识别哪个 setting 已完成
+  RUN_KEY="${DATASET}_s${_S}_p${_P}_l${_L}"
+  if [[ -n "$TAG_SUFFIX" ]]; then
+    RUN_KEY="${RUN_KEY}_${TAG_SUFFIX}"
+  fi
+  DONE_FILE="${_DONE_DIR}/${RUN_KEY}.DONE"
+
+  echo
+  echo " -----------------------------------------------------------------"
+  echo "  [${RUNC}/${#RUN_JOBS[@]}] run ${RUN_KEY}"
+  echo "  -----------------------------------------------------------------"
+  if [[ -f "$DONE_FILE" ]]; then
+    echo "  ✅ SKIP （已找到 DONE 标记: ${DONE_FILE}）。想重跑传 --rerun 或 rm -f ${DONE_FILE}"
+    # summary 也补条记录（resume 后重新打开 summary 能看到历史完成项）
+    "${PY:-python3}" - "$_ONE_SUMMARY" "$RUN_KEY" 0 <<'PY'
+import json, sys, pathlib
+p, rk, rc = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+obj = json.loads(p.read_text())
+obj.setdefault("run_order", [])
+if rk not in obj["run_order"]: obj["run_order"].append(rk)
+st = obj["runs"].get(rk, {})
+if not st:
+    obj["runs"][rk] = {"run_key": rk, "exit_code": 0, "status": "DONE (resume-skip)"}
+p.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
+PY
+    continue
+  fi
+
+  # ---------- 执行 1 run：调用脚本自身（递归），传 --dataset + 显式 S/P/L + --mode single。
+  #  特别：把 --_ignore-run-mode 作为内部 flag（或直接强制 single）；子进程只跑 1 setting
+  SUB_ARGS2=(
+    --dataset "$DATASET"
+    --gpu-tier "$GPU_TIER"
+    --mode single
+    --seq-len "$_S"
+    --pred-len "$_P"
+    --label-len "$_L"
+  )
+  [[ $NO_VRAM_CHECK      -eq 1 ]] && SUB_ARGS2+=( --no-vram-check )
+  [[ $FORCE_TRAFFIC      -eq 1 ]] && SUB_ARGS2+=( --force-traffic )
+  [[ $ALLOW_NONSTANDARD  -eq 1 ]] && SUB_ARGS2+=( --allow-nonstandard-setting )
+  [[ $NO_SOTA_FLAGS      -eq 1 ]] && SUB_ARGS2+=( --no-sota-flags )
+  [[ $DRY_RUN            -eq 1 ]] && SUB_ARGS2+=( --dry-run )
+  # CONTINUE_ON_FAIL / RERUN 已经在此层级处理，子 run 不再传（子 run 是 1 setting，失败即失败）
+  [[ -n "$EXTRA_ARGS"    ]] && SUB_ARGS2+=( --extra "$EXTRA_ARGS" )
+  [[ -n "$TAG_SUFFIX"    ]] && SUB_ARGS2+=( --tag-suffix "$TAG_SUFFIX" )
+  [[ -n "${PY:-}"        ]] && SUB_ARGS2+=( --py "$PY" )
+
+  set +e
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "  [dry-run][${RUN_KEY}] 子命令: bash $0 ${SUB_ARGS2[*]}"
+    SUB_EXIT2=0
+  else
+    bash "$0" "${SUB_ARGS2[@]}"
+    SUB_EXIT2=$?
+  fi
+  set -e
+
+  if [[ $SUB_EXIT2 -eq 0 ]]; then
+    if [[ $DRY_RUN -ne 1 ]]; then
+      echo "OK:${RUN_KEY}" >"${DONE_FILE}"
+    fi
+    echo "  ✅ ${RUN_KEY} done (exit=0) → ${DONE_FILE}"
+  else
+    RUN_EXIT_TOTAL=$((RUN_EXIT_TOTAL + 1))
+    echo "  ❌ ${RUN_KEY} FAIL exit=${SUB_EXIT2}" >&2
+    if [[ $CONTINUE_ON_FAIL -eq 0 ]]; then
+      echo "停止本 dataset 后续 setting（传 --continue-on-fail 继续跑下一个 setting）。" >&2
+      # 记 summary
+      "${PY:-python3}" - "$_ONE_SUMMARY" "$RUN_KEY" "$SUB_EXIT2" "ABORTED" <<'PY'
+import json, sys, pathlib
+p, rk, rc, status = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
+obj = json.loads(p.read_text())
+obj.setdefault("run_order", [])
+if rk not in obj["run_order"]: obj["run_order"].append(rk)
+obj["runs"][rk] = {"run_key": rk, "exit_code": rc, "status": status}
+p.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
+PY
+      exit $RUN_EXIT_TOTAL
+    fi
+  fi
+  # summary 记一条（允许 subprocess python path 未设置，summary 失败不致命 → warning only）
+  set +e
+  "${PY:-python3}" - "$_ONE_SUMMARY" "$RUN_KEY" "$SUB_EXIT2" <<'PY'
+import json, sys, pathlib
+p, rk, rc = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+obj = json.loads(p.read_text())
+obj.setdefault("run_order", [])
+if rk not in obj["run_order"]: obj["run_order"].append(rk)
+if rk not in obj["runs"] or obj["runs"][rk].get("status","") in ("FAILED","ABORTED",""):
+    obj["runs"][rk] = {
+      "run_key": rk,
+      "exit_code": rc,
+      "status": "OK" if rc == 0 else ("FAILED" if rc != 0 else "OK"),
+    }
+p.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
+PY
+  _SM=$?
+  if [[ $_SM -ne 0 ]]; then
+    echo "[summary warning] python3/summary 失败 (exit $_SM，记录 summary 非致命)" >&2
+  fi
+  set -e
+done
+
+echo
+echo "================================================================="
+echo " dataset=${DATASET} 跑程:  done=$(( ${#RUN_JOBS[@]} - RUN_EXIT_TOTAL )) / fail=${RUN_EXIT_TOTAL} / total=${#RUN_JOBS[@]}"
+echo " one-ds summary: ${_ONE_SUMMARY}"
+echo "================================================================="
+
+if [[ $RUN_EXIT_TOTAL -ne 0 ]]; then
+  echo "共 ${RUN_EXIT_TOTAL} 个 run 失败。" >&2
+  exit $RUN_EXIT_TOTAL
+fi
+exit 0
+# ================= 下面所有原 SINGLE-dataset 超参映射 + VRAM 检查 + 训练启动代码保留（子进程 single 模式会走到）==================
 
 # ------------------------------------------------------------ setting 校验
 STANDARD_SEQS=" 96 336 512 "
