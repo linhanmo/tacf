@@ -46,9 +46,10 @@ die() { echo "ERROR: $*" >&2 ; exit 2 ; }
 DATASET=""
 MULTI_MODE=""            # "all" | "list" | "" (single)
 DATASETS_LIST=""
-RUN_MODE="single"        # v4 new: single | full
+RUN_MODE="full"           # v5 default=full  (用户要求默认每个都跑 12 个顶会标准 setting)
                         #   - single: 1 dataset × 1 setting (seq_len × pred_len)
                         #   - full  : 1 dataset × 12 standard settings = 3×seq × 4×pred = {96,336,512} × {96,192,336,720}
+                        # 想回退旧"只跑 1 setting per DS"行为，显式传 --mode single
 CONTINUE_ON_FAIL=0
 RERUN=0                  # default: resume, skip runs marked .DONE; --rerun 强制重跑
 TAG_SUFFIX=""
@@ -150,6 +151,10 @@ while [[ $# -gt 0 ]]; do
     --tag-suffix)                TAG_SUFFIX="$2"; shift 2 ;;
     --run-tag-suffix)            TAG_SUFFIX="$2"; shift 2 ;;   # alias
     --py)                        PY="$2"; shift 2 ;;
+    # --- internal flag (hidden, MULTI parent -> child process passes --_batch-dir to
+    #     point the child's DONE/summary output to the shared MULTI batch dir instead of
+    #     its own default one_ds_* dir. 用户一般不应该传，但接受且不报错。)
+    --_batch-dir)                INTERNAL_BATCH_DIR="$2"; shift 2 ;;
     --)                          shift; EXTRA_ARGS="$EXTRA_ARGS $*"; break ;;
     *)                           die "Unknown arg: $1 (use --help)" ;;
   esac
@@ -323,18 +328,12 @@ fi
 #                                中途 Ctrl+C，下次 SAME CLI 自动跳过已写 DONE 标记的 setting
 #
 # --_batch-dir <dir>：MULTI 进程传给子进程，把 DONE/summary 写到同一个批目录。
-#   若用户直接跑单 dataset（非 MULTI 递归），--_batch-dir 未传，则自动建：
-#       logs/one_ds_{DS}_{RUN_MODE}_{GPU_TIER}[_{TAG_SUFFIX}]
+#   注意：主 argparse 已处理 --_batch-dir，存到 INTERNAL_BATCH_DIR 变量。这里只是转发。
 _BATCH_DIR=""
 RUN_EXIT_TOTAL=0
-
-# --- 额外内部 flag（MULTI 子进程透传的，用户不应该用，所以 hide 掉）---
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --_batch-dir) _BATCH_DIR="$2"; shift 2 ;;
-    *) shift ;;  # 其它参数已经解析过了，丢掉
-  esac
-done
+if [[ -n "${INTERNAL_BATCH_DIR:-}" ]]; then
+  _BATCH_DIR="${INTERNAL_BATCH_DIR}"
+fi
 
 [[ -n "$DATASET"   ]] || die "请传 --dataset <DS> 或 --all / --datasets \"DS1 DS2 ...\"。支持: $ALL_7_DATASETS traffic"
 
