@@ -91,7 +91,7 @@ bash scaled_runs.sh --dataset ETTh1         --gpu-tier 24G    # ETT × 24G 全�
 bash scaled_runs.sh --dataset weather       --gpu-tier 8G     # Weather × 8G
 bash scaled_runs.sh --dataset electricity   --gpu-tier 24G    # Elec D=321 × 24G
 bash scaled_runs.sh --dataset exchange_rate --gpu-tier 8G     # Exchange D=8 × 8G
-bash scaled_runs.sh --all --gpu-tier 24G
+bash scaled_runs.sh --all --gpu-tier 24G                      # 跑全量+resume
 
 # traffic 默认禁跑，要强制请传 --force-traffic：
 bash scaled_runs.sh --dataset traffic --gpu-tier 24G --force-traffic
