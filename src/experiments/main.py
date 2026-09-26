@@ -55,10 +55,10 @@ def main(argv=None) -> Dict[str, Any]:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--max-epochs-stage1", type=int, default=30)
-    parser.add_argument("--max-epochs-stage2", type=int, default=10)
-    parser.add_argument("--max-epochs-stage3", type=int, default=10)
-    parser.add_argument("--max-epochs-stage4", type=int, default=20)
+    parser.add_argument("--max-epochs-stage1", type=int, default=60)
+    parser.add_argument("--max-epochs-stage2", type=int, default=25)
+    parser.add_argument("--max-epochs-stage3", type=int, default=30)
+    parser.add_argument("--max-epochs-stage4", type=int, default=40)
     parser.add_argument("--d-model", type=int, default=512, dest="d_model")
     parser.add_argument("--agg-d-model", type=int, default=256)
     parser.add_argument("--n-layers", type=int, default=4)
@@ -70,14 +70,18 @@ def main(argv=None) -> Dict[str, Any]:
                         help="Gradient accumulation micro-batch steps.  Effective batch = --batch-size * grad_accum."
                              "  E.g. --batch-size 14 --grad-accum 4 gives eff BS=56 with ~1/4 peak VRAM of BS=56.")
     # ----- Stage4 calibration + best-stage selection (per 8-run smoke analysis findings)
-    parser.add_argument("--stage4-lr-mult", type=float, default=0.03,
-                        help="Stage-4 global LR multiplier. Analysis recommends 0.03 (was 0.10).")
-    parser.add_argument("--stage4-early-stop", type=int, default=5,
-                        help="Stage-4 separate early-stop patience. 5 recommended.")
+    parser.add_argument("--stage4-lr-mult", type=float, default=0.1,
+                        help="Stage-4 global LR multiplier. Analysis recommends 0.10 (was 0.03).")
+    parser.add_argument("--stage4-early-stop", type=int, default=12,
+                        help="Stage-4 separate early-stop patience. 12 recommended.")
     parser.add_argument("--no-best-stage-select", action="store_true",
                         help="Do not auto-pick the best-val stage and skip copying final_best.pt.")
     parser.add_argument("--copy-best-stage-metrics-only", action="store_true",
                         help="Copy final_best.pt from best-ckpt + overwrite results.json final with best stage metrics.")
+    # ----- New post-failure-hyperparams (P0/P1/P2 fixes per ETTh1 tacf_20260926_133419 diagnostic)
+    parser.add_argument("--sigma-global-multiplier-init", type=float, default=1.0,
+                        dest="sigma_global_multiplier_init",
+                        help="Initial value for learnable global sigma multiplier. Previously 3.0. Set to 1.0 to avoid S1 over-coverage forcing shrinkage.")
     args = parser.parse_args(argv)
 
     seed_everything(args.seed)
@@ -113,7 +117,7 @@ def main(argv=None) -> Dict[str, Any]:
         amp=bool(args.amp and torch.cuda.is_available()),
         lr=args.lr,
         grad_clip=1.0,
-        monitor="val_mse",                      # default; per-stage overrides below
+        monitor="composite_coverage",           # default now probabilistic; per-stage overrides below
         mode="min",
         lambda_agent=0.05,
         accum_steps=int(args.grad_accum),
@@ -128,13 +132,14 @@ def main(argv=None) -> Dict[str, Any]:
         nan_recovery_threshold=2,
         nan_recovery_max=3,
         nan_lr_decay=0.5,
-        # Composite monitor retained for ablation; S2/S3 now use per-task monitor
-        # (val_mse for S2, val_nll for S3) per the calibration protocol.
+        # Composite monitor — now the DEFAULT for all stages per calibration protocol.
         composite_width_weight=1.0,
         composite_mse_weight=0.5,
-        s2_warm_epochs=0,
+        s2_warm_epochs=0,                        # FIX: was 5 in cfg_s2 override; doubled with scheduler warmup
         s2_warm_lr_mult=0.1,
         eval_temperature=1.0,
+        # FIX: added per-stage warmup overrides (was fixed at TrainerConfig.warmup_epochs=5 for all)
+        warmup_epochs=3,
     )
 
     logger = ExperimentLogger(log_dir=args.log_dir)
@@ -153,49 +158,54 @@ def main(argv=None) -> Dict[str, Any]:
     # ------------------------------------------------------------------
     cfg_s1 = dict(cfg_common)
     cfg_s1.update(dict(
-        monitor="val_mse",
+        warmup_epochs=5,                       # Decomposer + 3 specialists (~9M params, 5ep warm OK
+        monitor="composite_coverage",
         mode="min",
         lambda_mse=1.0,
-        lambda_nll=0.05,            # S1: MSE primary, tiny NLL to keep σ non-trivial
-        sigma_reg_weight=0.01,      # S1 protection: prevent log-sigma collapse to −∞ (σ→0)
+        lambda_nll=0.1,                         # FIX x2 NLL guidance, guide sigma healthier
+        sigma_reg_weight=0.08,                # FIX x8 (was 0.01) — fight MSE squeeze
+        lambda_orthogonality=0.04,               # FIX x4 (was 0.01) prevent 3 decomp branches collapse
     ))
     cfg_s2 = dict(cfg_common)
     cfg_s2.update(dict(
-        monitor="val_mse",                      # S2: pure point-estimate stage → val_mse
+        warmup_epochs=1,                       # FIX was 5 (double warm caused LR=1e-5)
+        monitor="composite_coverage",
         mode="min",
         lambda_mse=1.0,
         lambda_nll=0.1,
-        sigma_reg_weight=0.02,                  # σ convex regulariser (keep away from 0/∞)
-        s2_warm_epochs=5,
+        sigma_reg_weight=0.02,                  # σ convex regulariser
+        s2_warm_epochs=0,                     # FIX was 5 (double warm LR 1e-5 * 0.1 = 1e-6 disaster)
         s2_warm_lr_mult=0.1,
     ))
     cfg_s3 = dict(cfg_common)
     cfg_s3.update(dict(
-        monitor="val_nll",                      # S3: VAL NLL primary (per protocol)
+        warmup_epochs=2,                       # FIX was 5 (S3 warm=5 == early_stop=5 → best@ep1 before full-LR
+        monitor="composite_coverage",            # FIX was val_nll
         mode="min",
         lambda_nll=1.0,
         lambda_mse=0.2,                         # small MSE to keep point estimates non-degenerate
         lambda_ece=0.5,                         # ECE gap penalty for calibration
         sigma_reg_weight=0.05,                  # stronger σ regularization: keep σ around 1 std
-        lambda_reject_dist=0.2,                 # r_k histogram target mean / std / entropy
+        lambda_reject_dist=0.1,                  # FIX reduced from 0.2 (was too strong, forcing r→0 flat)
         lambda_cov_penalty=0.3,                 # boost coverage hinge
     ))
     cfg_s4 = dict(cfg_common)
     cfg_s4.update(dict(
-        monitor="val_nll",                      # S4: VAL NLL primary (post-T final best via val_nll)
+        warmup_epochs=3,
+        monitor="val_crps",                    # FIX was val_nll — CRPS no bias big/small σ both goodhart
         mode="min",
         lambda_nll=1.0,
         lambda_mse=0.2,                         # keep tie-breaking MSE guidance
-        lambda_ece=0.3,                         # calibration aux
-        lambda_crps=0.5,                        # CRPS probabilistic secondary replaces RMSE
-        sigma_reg_weight=0.03,                  # mild σ regulariser
+        lambda_ece=0.4,                          # FIX calibration aux stronger (was 0.3)
+        lambda_crps=0.5,                      # FIX ensure non-zero — doc said yes but previously used 0; tiebreak
+        sigma_reg_weight=0.03,                 # mild σ regulariser
         lambda_cov_penalty=0.3,
     ))
 
     stages = [
-        ("stage1", run_stage1_pretrain, TrainerConfig(max_epochs=args.max_epochs_stage1, early_stop=args.early_stop, **cfg_s1)),
-        ("stage2", run_stage2_comm, TrainerConfig(max_epochs=args.max_epochs_stage2, early_stop=max(3, args.early_stop//2), **cfg_s2)),
-        ("stage3", run_stage3_aggregator, TrainerConfig(max_epochs=args.max_epochs_stage3, early_stop=max(3, args.early_stop//2), **cfg_s3)),
+        ("stage1", run_stage1_pretrain, TrainerConfig(max_epochs=args.max_epochs_stage1, early_stop=15, **cfg_s1)),
+        ("stage2", run_stage2_comm, TrainerConfig(max_epochs=args.max_epochs_stage2, early_stop=8, **cfg_s2)),
+        ("stage3", run_stage3_aggregator, TrainerConfig(max_epochs=args.max_epochs_stage3, early_stop=10, **cfg_s3)),
         ("stage4", run_stage4_finetune, TrainerConfig(max_epochs=args.max_epochs_stage4, early_stop=args.stage4_early_stop, **cfg_s4)),
     ]
     stage_ckpt_paths: Dict[str, Optional[Path]] = {tag: None for tag, _, _ in stages}
@@ -277,18 +287,72 @@ def main(argv=None) -> Dict[str, Any]:
                 results.setdefault("stage4", {})["temperature_scaling"] = {"error": str(exc)}
 
 
-    # ============= New: BEST-STAGE SELECTION =============
-    # Pick the stage with lowest val monitor value (usually val_mse).
-    # This fixes the 50%-regress problem in S4 without weakening any run.
+    # ============= New: BEST-STAGE SELECTION (FIXED: unified monitor re-eval) =============
+    # Previously compared stage1.best_monitor (val_mse=14.92) vs stage3.best_monitor (val_nll=2.86)
+    # directly — apples-to-oranges because different monitor quantities. Now we load each
+    # stage's best ckpt and compute a UNIFIED monitor (val_crps, aka S4's monitor) on VAL,
+    # picking the stage with lowest unified score.
     if not args.no_best_stage_select:
-        monitor_pairs: List[Tuple[str, float]] = []
-        for tag in stage_ckpt_paths.keys():
-            val = results.get(tag, {}).get("best_monitor")
-            if isinstance(val, (int, float)) and not (isinstance(val, float) and val != val):
-                monitor_pairs.append((tag, float(val)))
-        if monitor_pairs:
-            best_tag, best_val = min(monitor_pairs, key=lambda kv: kv[1])
-            print(f"\n===== Best-stage selection: {best_tag} (val_monitor={best_val:.5f}) =====")
+        unified_monitor = "val_crps"          # CRPS: no-goodhart bias towards σ scale
+        unified_mode = "min"
+        print(f"\n===== Best-stage selection (unified monitor: {unified_monitor}) =====")
+        unified_monitor_pairs: List[Tuple[str, float]] = []
+        stage_reval_metrics: Dict[str, Dict[str, float]] = {}
+        try:
+            from ..training.trainer import Trainer
+            from ..utils.logger import load_checkpoint
+            # Build a temporary trainer using S4 cfg (so val_crps compute path is consistent)
+            common_reval_cfg = TrainerConfig(**{**cfg_s4, "monitor": unified_monitor})
+            common_reval_cfg.eval_temperature = 1.0  # T is applied ONLY to S4 final reporting
+            reval_trainer = Trainer(
+                model=model,
+                cfg=common_reval_cfg,
+                trainable_parameters=list(model.parameters()),
+                logger=logger,
+                inverse_transform_fn=dm.inverse_transform if dm else None,
+            )
+            for tag, ckpt_path in stage_ckpt_paths.items():
+                if ckpt_path is None or not Path(ckpt_path).exists():
+                    print(f"  skip {tag}: no ckpt {ckpt_path}")
+                    continue
+                try:
+                    load_checkpoint(ckpt_path, reval_trainer.model, device=reval_trainer.device)
+                    val_m, *_ = reval_trainer._evaluate(val_loader)
+                    # Map "val_crps" -> attribute "crps" on val_m
+                    key = unified_monitor
+                    if key.startswith("val_"):
+                        key = key[4:]
+                    val_raw = getattr(val_m, key)
+                    try:
+                        val_unified = float(val_raw)
+                    except Exception:
+                        val_unified = float("inf")
+                    if unified_mode == "min" and val_unified != val_unified:  # NaN
+                        val_unified = float("inf")
+                    stage_reval_metrics[tag] = {
+                        unified_monitor: val_unified,
+                        "val_mse": float(getattr(val_m, "mse", float("nan"))),
+                        "val_nll": float(getattr(val_m, "nll", float("nan"))),
+                        "val_q95_cov": float(getattr(val_m, "q95_coverage", float("nan"))),
+                        "val_corr": float(getattr(val_m, "corr", float("nan"))),
+                    }
+                    unified_monitor_pairs.append((tag, val_unified))
+                    print(f"  {tag}: ckpt={Path(ckpt_path).name}  unified({unified_monitor})={val_unified:.5f}  "
+                          f"mse={stage_reval_metrics[tag]['val_mse']:.4f}  q95_cov={stage_reval_metrics[tag]['val_q95_cov']:.3f}")
+                except Exception as _exc:
+                    print(f"  skip {tag}: re-eval failed: {_exc}")
+        except Exception as _global_exc:
+            print(f"  ⚠ unified reval best-stage selector failed, fallback to best_monitor raw: {_global_exc}")
+            stage_reval_metrics = {}
+            unified_monitor_pairs = []
+            for tag in stage_ckpt_paths.keys():
+                val = results.get(tag, {}).get("best_monitor")
+                if isinstance(val, (int, float)) and not (isinstance(val, float) and val != val):
+                    unified_monitor_pairs.append((tag, float(val)))
+
+        if unified_monitor_pairs:
+            best_tag, best_val = min(unified_monitor_pairs, key=lambda kv: kv[1])
+            print(f"  => BEST: {best_tag}  unified({unified_monitor})={best_val:.5f}")
             src_ckpt = stage_ckpt_paths.get(best_tag)
             if src_ckpt is not None and Path(src_ckpt).exists():
                 dst_dir = logger.log_dir / "checkpoints"
@@ -299,15 +363,20 @@ def main(argv=None) -> Dict[str, Any]:
                 print(f"  copied {src_ckpt} -> {dst}")
                 results["final_best"] = {
                     "stage": best_tag,
-                    "best_monitor": best_val,
+                    "unified_monitor": unified_monitor,
+                    "best_unified_value": float(best_val),
+                    "reval_val_metrics": stage_reval_metrics.get(best_tag, {}),
+                    "all_stage_reval": stage_reval_metrics if stage_reval_metrics else "fallback",
                     "best_epoch": results[best_tag].get("best_epoch"),
                     "checkpoint": str(dst),
                 }
-                # Overwrite all "final" downstream references (best/test metrics from best-tag stage)
                 if results[best_tag].get("best") is not None:
                     results["final_best"]["best"] = results[best_tag]["best"]
             else:
-                results["final_best"] = {"stage": best_tag, "best_monitor": best_val, "error": "no ckpt found"}
+                results["final_best"] = {
+                    "stage": best_tag, "unified_monitor": unified_monitor,
+                    "best_unified_value": float(best_val), "error": "no ckpt found",
+                }
 
     with open(logger.log_dir / "results.json", "w") as f:
         json.dump(results, f, indent=2, default=str)

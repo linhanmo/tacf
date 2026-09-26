@@ -96,6 +96,11 @@ def run_stage3_aggregator(
     We keep decomposer / specialists / consensus frozen and teach the
     LightMamba aggregator to emit sensible mixture weights α and rejection
     signals r using a simple NLL + MSE + reject regulariser loss.
+
+    For the first time we *unfreeze* the learnable sigma_global_multiplier:
+    the aggregator plus a single global scale dial are the right place to
+    absorb any residual under/over-coverage left in the S2 consensus
+    distributions.
     """
     if cfg is None:
         cfg = TrainerConfig(**kwargs)
@@ -103,6 +108,12 @@ def run_stage3_aggregator(
     freeze_module(model.specialists)
     freeze_module(model.consensus)
     unfreeze_module(model.aggregator)
+    # FIXED 2026-09-26: S3+S4 — unfreeze sigma_global_multiplier so overall
+    # scale can be tuned together with aggregator α/r weights.
+    if hasattr(model, "sigma_global_multiplier") and isinstance(
+        getattr(model, "sigma_global_multiplier"), torch.nn.Parameter
+    ):
+        model.sigma_global_multiplier.requires_grad_(True)
     trainer = Trainer(
         model=model,
         cfg=cfg,

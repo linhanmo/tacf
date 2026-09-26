@@ -104,11 +104,23 @@ def run_stage1_pretrain(
     independently with Gaussian NLL + MSE, reinforced with the structural
     heterogeneous losses (TV on trend, Fourier-seasonal on cycle, L1-residual
     on local) plus the decomposer orthogonality penalty.
+
+    Additionally we freeze the learnable sigma_global_multiplier during S1 so
+    that σ calibration is fully driven by the specialist heads +
+    sigma_reg_weight, and only left to the aggregator (S3) and E2E finetune
+    (S4) to fine-tune the overall scale.  This prevents the model from using
+    the global scalar as a "cheat code" to compensate for specialist collapse
+    in the first few epochs.
     """
     if cfg is None:
         cfg = TrainerConfig(**kwargs)
     freeze_module(model.consensus)
     freeze_module(model.aggregator)
+    # FIXED 2026-09-26: S1 σ stability — freeze sigma_global_multiplier.
+    if hasattr(model, "sigma_global_multiplier") and isinstance(
+        getattr(model, "sigma_global_multiplier"), torch.nn.Parameter
+    ):
+        model.sigma_global_multiplier.requires_grad_(False)
     trainer = Trainer(
         model=model,
         cfg=cfg,

@@ -172,6 +172,21 @@ class ConsensusLayer(nn.Module):
             nn.Linear(d_hidden // 4, pred_len * out_channels),
         )
         self.min_sigma = 1e-4
+        # FIXED 2026-09-26: gate initialisation — bias=-2 on the final Linear
+        # so sigmoid(-2) ≈ 0.12 strongly favours identity at init.  Previously
+        # gate_mu/gate_h final bias = 0 → sigmoid(0)=0.5 → 50% correction
+        # amplitude on round 0.  Combined with sigma_global_multiplier_init=3.0
+        # the consensus was over-writing expert signals *before* any training,
+        # with S2 double-warmup preventing recovery.  Doubling the sigmoid
+        # output (range 0→2) lets the gate grow beyond 1× once trained — the
+        # residual `x + g·Δ` then supports up to 2× the raw consensus delta
+        # (including overshoot if needed for aggressive correction).
+        with torch.no_grad():
+            for _seq in (self.gate_mu, self.gate_h):
+                _last = [m for m in _seq if isinstance(m, nn.Linear)][-1]
+                nn.init.zeros_(_last.weight)
+                if _last.bias is not None:
+                    nn.init.constant_(_last.bias, -2.0)
 
     def forward(
         self,
@@ -217,7 +232,12 @@ class ConsensusLayer(nn.Module):
                 mu_iv = mu_weighted
 
             delta_mu = self.norm_mu(mu_iv - mu_in)
-            g_mu = self.gate_mu(h_new).view(B, K, 1, 1)
+            # FIXED 2026-09-26: g_mu range 0→2.  Identity bias at init (bias=-2
+            # → sigmoid(-2) ≈ 0.12 × 2 ≈ 0.24) means ~24% of consensus delta
+            # is applied initially, growing to up to 2× once gradients flow.
+            # Previously g_mu was in [0, 1] with init ≈ 0.5 (overly aggressive
+            # correction before any training on ETTh1).
+            g_mu = self.gate_mu(h_new).view(B, K, 1, 1) * 2.0
             mu_new = mu_in + g_mu * delta_mu
 
             precision = 1.0 / (sigma.pow(2) + 1e-6)
@@ -228,7 +248,21 @@ class ConsensusLayer(nn.Module):
             delta_sigma = sigma_iv - sigma
 
             delta_sigma_raw = self.delta_sigma_head(h_new).view(B, K, P, D)
-            g_sigma = torch.sigmoid(delta_sigma_raw)
+            # FIXED 2026-09-26: g_sigma previously was sigmoid(delta_sigma_raw)
+            # clamped to [0, 1], so sigma_new = sigma + in-(0,1)*(sigma_iv-sigma)
+            # — this can *only shrink sigma* when sigma_iv < sigma (the usual
+            # direction when S1 already collapsed sigma and IVW weights are
+            # peaked).  Switch to a Tanh gate ∈ [-1, +1] with learnable sign
+            # and magnitude so consensus can both *shrink* (σ_iv<σ) and *grow*
+            # σ when IVW says the group mean has greater uncertainty than any
+            # single agent — exactly the recovery S1-collapsed sigmas need.
+            # Raw delta_sigma head stays identical (preserves pretrained
+            # capability on datasets where consensus was shrinking toward IVW).
+            g_sigma = torch.tanh(delta_sigma_raw)  # ∈ [-1, +1]
+            # When g_sigma=+1 (positive sign learned) → sigma_new = sigma_iv.
+            # When g_sigma=−1 (negative sign learned, the new escape path) →
+            # sigma_new = 2·sigma − sigma_iv (overshoots away from IVW in the
+            # *widen* direction if IVW was shrinking σ).
             sigma_new = sigma + g_sigma * delta_sigma
             sigma_new = torch.clamp(sigma_new, min=self.min_sigma)
 
