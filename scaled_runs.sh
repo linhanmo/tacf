@@ -78,6 +78,172 @@ LOG_ROOT="${SCRIPT_DIR}/logs"
 FULL_SEQS="96 336 512"
 FULL_PREDS="96 192 336 720"
 
+# =====================================================================
+# 超参 / VRAM / slogan / vram-check 构造辅助函数
+# ---------------------------------------------------------------------
+#   说明：SINGLE/FULL 叶子层的 RUN_JOBS 循环需要直接构造 main.py 参数，
+#         不再用 bash $0 递归（会无限循环）。所以把下面 training launch 代码段
+#         的 "case dataset:tier → MAIN_ARGS" 全部封装为 4 个纯函数：
+#
+#   1) _build_sota_flags(NO_SOTA_FLAGS:0/1)
+#        → prints SOTA_FLAGS 字符串（默认 RevIN + DLinear trend + σ_init=1.0）
+#   2) _build_hypers(dataset, gpu_tier, NO_SOTA_FLAGS, seq_len, pred_len, label_len)
+#        → prints {ETT|WEATHER|ELEC|EXCHANGE|TRAFFIC}_STAGE_COMMON 字符串
+#           （含 --d-model / --n-layers / --max-epochs-stage* / --amp / --lr /
+#            --seq-len / --pred-len / --label-len / SOTA_FLAGS）
+#           不含 --batch-size / --grad-accum
+#   3) _build_phys_bs(dataset, gpu_tier)
+#        → prints "--batch-size N --grad-accum M" 字符串
+#   4) _extract_flag(tokens_str, flag_name, default)
+#        → extracts the value of --flag_name from the space-separated token string
+#   5) _vram_check_wrapper(dataset, tier, no_vram_check_01, force_traffic_01, phys_bs_str)
+#        → runs estimate_vram_fast.py VRAM sanity check （和旧 launch 代码一致）
+#   6) _print_trainset_slogan(dataset, tier, seq, pred, label, phys_bs_str, no_sota, no_vram, force_traffic)
+#        → prints 原 training launch 那段 echo banner（让用户看到 d_model/BS_eff 等信息）
+# =====================================================================
+
+_build_sota_flags() {
+  local NOSF=$1
+  if [[ "$NOSF" -eq 1 ]]; then echo "";
+  else echo "--use-revin --use-dlinear-trend-head --sigma-global-multiplier-init 1.0"; fi
+}
+
+_extract_flag() {
+  # $1 = tokens string (space separated); $2 = flag name (without --); $3 = default
+  local tokens="$1"
+  local key="--$2"
+  local nxt=0
+  local tok
+  for tok in $tokens; do
+    if [[ $nxt -eq 1 ]]; then echo "$tok"; return; fi
+    if [[ "$tok" == "$key" ]]; then nxt=1; fi
+  done
+  echo "$3"
+}
+
+_build_hypers() {
+  # args: dataset gpu_tier seq pred label no_sota_flags
+  local DS=$1 TIER=$2 SEQ=$3 PRED=$4 LAB=$5 NOSF=$6
+  local SOTA_F
+  SOTA_F=$(_build_sota_flags "$NOSF")
+
+  local EPOCH_COMMON="--max-epochs-stage1 60 --max-epochs-stage2 25 --max-epochs-stage3 30 --max-epochs-stage4 40 --early-stop 10 --stage4-lr-mult 0.10 --stage4-early-stop 12 --amp"
+
+  local CAPACITY=""
+  case "$DS" in
+    ETTh1|ETTh2|ETTm1|ETTm2)
+      CAPACITY="--d-model 768 --agg-d-model 384 --n-layers 6 --lr 1e-3"
+      ;;
+    weather)
+      CAPACITY="--d-model 768 --agg-d-model 384 --n-layers 6 --lr 8e-4"
+      ;;
+    electricity)
+      CAPACITY="--d-model 576 --agg-d-model 288 --n-layers 4 --lr 6e-4"
+      ;;
+    exchange_rate)
+      CAPACITY="--d-model 768 --agg-d-model 384 --n-layers 6 --lr 1e-3"
+      ;;
+    traffic)
+      CAPACITY="--d-model 384 --agg-d-model 192 --n-layers 3 --lr 6e-4"
+      ;;
+    *)
+      die "_build_hypers: 未知 dataset=$DS"
+      ;;
+  esac
+  echo "${CAPACITY} ${EPOCH_COMMON} --seq-len ${SEQ} --pred-len ${PRED} --label-len ${LAB} ${SOTA_F}"
+}
+
+_build_phys_bs() {
+  local DS=$1 TIER=$2
+  case "${DS}:${TIER}" in
+    ETTh1:24G|ETTh2:24G|ETTm1:24G|ETTm2:24G) echo "--batch-size 16 --grad-accum 4" ;;
+    ETTh1:8G |ETTh2:8G |ETTm1:8G |ETTm2:8G ) echo "--batch-size 4  --grad-accum 16" ;;
+    weather:24G) echo "--batch-size 12 --grad-accum 4" ;;
+    weather:8G)  echo "--batch-size 3  --grad-accum 16" ;;
+    electricity:24G) echo "--batch-size 5 --grad-accum 10" ;;
+    electricity:8G)  echo "--batch-size 2 --grad-accum 25" ;;
+    exchange_rate:24G) echo "--batch-size 32 --grad-accum 2" ;;
+    exchange_rate:8G)  echo "--batch-size 8  --grad-accum 8" ;;
+    traffic:24G) echo "--batch-size 2 --grad-accum 32" ;;
+    traffic:8G)  echo "--batch-size 1 --grad-accum 64" ;;
+    *) die "_build_phys_bs: 未知 (dataset=$DS, tier=$TIER) 只支持 24G/8G 两档；traffic 请传 --force-traffic 绕过检查。" ;;
+  esac
+}
+
+_vram_check_wrapper() {
+  local DS=$1 TIER=$2 NO_VRAM=$3 FORCE_TR=$4 PHYS_BS_STR=$5
+  local D_MODEL_ N_LAYERS_ PHYS_BS_ GRAD_ACC_ EFF_BS_
+  if [[ "$NO_VRAM" -eq 1 ]]; then return 0; fi
+  if [[ ! -f estimate_vram_fast.py ]]; then return 0; fi
+  D_MODEL_=$(_extract_flag "$PHYS_BS_STR:dummy" d-model 768)  # placeholder; we don't have hypers here
+  PHYS_BS_=$(_extract_flag "$PHYS_BS_STR" batch-size 16)
+  N_LAYERS_="6"
+  case "$DS" in
+    ETTh1|ETTh2|ETTm1|ETTm2|weather|exchange_rate) D_MODEL_="768" ;;
+    electricity) D_MODEL_="576" ;;
+    traffic) D_MODEL_="384" ;;
+  esac
+  case "$DS" in
+    ETTh1|ETTh2|ETTm1|ETTm2|weather|exchange_rate) N_LAYERS_="6" ;;
+    electricity) N_LAYERS_="4" ;;
+    traffic) N_LAYERS_="3" ;;
+  esac
+  echo "--- estimate_vram_fast.py VRAM 预检 (dataset=${DS}, batch-size=${PHYS_BS_}, d=${D_MODEL_}, L=${N_LAYERS_}) ---"
+  set +e
+  ${PY:-python3} estimate_vram_fast.py \
+    --datasets "$DS" \
+    --seq-len "${SEQ_LEN:-336}" --pred-len "${PRED_LEN:-96}" \
+    --d-model "$D_MODEL_" --n-layers "$N_LAYERS_" \
+    --batch-size "$PHYS_BS_" --amp
+  set -e
+  local CAP=""
+  case "$TIER" in
+    24G) CAP="21.6" ;;
+    8G)  CAP="7.2"  ;;
+    *)   CAP="?" ;;
+  esac
+  echo "— GPU tier ${TIER} 安全上限 ≈ 0.9 × tier = ${CAP}GB。超了就 Ctrl+C 中断，调小 --batch-size/调大 --grad-accum。 —"
+  echo
+}
+
+_print_trainset_slogan() {
+  local DS=$1 TIER=$2 SEQ=$3 PRED=$4 LAB=$5 PHYS_BS_STR=$6 NOSF=$7 NO_VRAM=$8 FORCE_TR=$9
+  local HYP
+  HYP=$(_build_hypers "$DS" "$TIER" "$SEQ" "$PRED" "$LAB" "$NOSF")
+  local D_MODEL_ AGG_D_ N_LAYERS_ PHYS_BS_ GRAD_ACC_ LR_
+  D_MODEL_=$(_extract_flag  "$HYP" d-model       "768")
+  AGG_D_=$(_extract_flag    "$HYP" agg-d-model   "384")
+  N_LAYERS_=$(_extract_flag "$HYP" n-layers      "6")
+  LR_=$(_extract_flag       "$HYP" lr            "1e-3")
+  PHYS_BS_=$(_extract_flag  "$PHYS_BS_STR" batch-size "16")
+  GRAD_ACC_=$(_extract_flag "$PHYS_BS_STR" grad-accum "1")
+  local EFF_BS_=$(( PHYS_BS_ * GRAD_ACC_ ))
+
+  # standardity check
+  local SEQ_OK=0 PRED_OK=0
+  case " $FULL_SEQS "  in *" $SEQ "*)  SEQ_OK=1 ;; esac
+  case " $FULL_PREDS " in *" $PRED "*) PRED_OK=1 ;; esac
+  local STD_MSG="STANDARD (SOTA-公平对比可用)"
+  if [[ $SEQ_OK -eq 0 || $PRED_OK -eq 0 ]]; then STD_MSG="NON-STANDARD（SOTA 对比不公平）"; fi
+  local SOTA_STATE="ON (RevIN + DLinear trend + σ_init=1.0 + new-stage-hparams)"
+  if [[ $NOSF -eq 1 ]]; then SOTA_STATE="OFF（baseline 回退，不含 SOTA 升级）"; fi
+
+  cat <<EOF
+========================================================
+ TACF SOTA-对齐 scaled run: dataset=${DS}  tier=${TIER}
+========================================================
+  setting (seq → pred)                    :  ${SEQ} → ${PRED}   [${STD_MSG}]
+  label_len                               :  ${LAB}  (惯例: pred_len/2)
+  SOTA 升级开关                           :  ${SOTA_STATE}
+  d_model / n_layers / agg_d_model        :  ${D_MODEL_} / ${N_LAYERS_} / ${AGG_D_}
+  物理 batch size (→ VRAM)                :  ${PHYS_BS_}
+  梯度累积 accum_steps                    :  ${GRAD_ACC_}
+  等效 batch size (→ 梯度噪声/BN)         :  ${EFF_BS_}
+  learning rate                           :  ${LR_}
+EOF
+}
+
+
 # ---------------------------------------------------------------- parser
 usage() {
   echo "Usage: $0 [OPTIONS]"
@@ -426,32 +592,69 @@ PY
     continue
   fi
 
-  # ---------- 执行 1 run：调用脚本自身（递归），传 --dataset + 显式 S/P/L + --mode single。
-  #  特别：把 --_ignore-run-mode 作为内部 flag（或直接强制 single）；子进程只跑 1 setting
-  SUB_ARGS2=(
+  # ---------- 执行 1 run：叶子节点直接调 python main.py（禁止递归 bash $0！否则陷入
+  #   SINGLE → SINGLE 死循环。以前写法是 bash $0 --mode single 再递归回来 → 无限打印 banner）
+  _SOTA_FLAGS_SINGLE=""
+  _HYPERS_SINGLE=""
+  _VRAMBS_SINGLE=""
+  set +eu
+  _SOTA_FLAGS_SINGLE=$(_build_sota_flags "$NO_SOTA_FLAGS")
+  _HYPERS_SINGLE=$(_build_hypers "$DATASET" "$GPU_TIER" "$_S" "$_P" "$_L" "$NO_SOTA_FLAGS")
+  _VRAMBS_SINGLE=$(_build_phys_bs "$DATASET" "$GPU_TIER")
+  set -eu
+  _PY_CMD_SINGLE="${PY:-python3}"
+
+  if [[ $DRY_RUN -ne 1 ]]; then
+    _vram_check_wrapper "$DATASET" "$GPU_TIER" "$NO_VRAM_CHECK" "$FORCE_TRAFFIC" "$_VRAMBS_SINGLE"
+  fi
+
+  _SLOGAN_BAR_SINGLE=""
+  _SLOGAN_BAR_SINGLE=$(_print_trainset_slogan \
+      "$DATASET" "$GPU_TIER" "$_S" "$_P" "$_L" \
+      "$_VRAMBS_SINGLE" "$NO_SOTA_FLAGS" "$NO_VRAM_CHECK" "$FORCE_TRAFFIC")
+
+  # — 构造 main.py 单 run 完整参数 ——
+  MAIN_ARGS_SINGLE=(
+    -u -m src.experiments.main
     --dataset "$DATASET"
-    --gpu-tier "$GPU_TIER"
-    --mode single
-    --seq-len "$_S"
-    --pred-len "$_P"
-    --label-len "$_L"
   )
-  [[ $NO_VRAM_CHECK      -eq 1 ]] && SUB_ARGS2+=( --no-vram-check )
-  [[ $FORCE_TRAFFIC      -eq 1 ]] && SUB_ARGS2+=( --force-traffic )
-  [[ $ALLOW_NONSTANDARD  -eq 1 ]] && SUB_ARGS2+=( --allow-nonstandard-setting )
-  [[ $NO_SOTA_FLAGS      -eq 1 ]] && SUB_ARGS2+=( --no-sota-flags )
-  [[ $DRY_RUN            -eq 1 ]] && SUB_ARGS2+=( --dry-run )
-  # CONTINUE_ON_FAIL / RERUN 已经在此层级处理，子 run 不再传（子 run 是 1 setting，失败即失败）
-  [[ -n "$EXTRA_ARGS"    ]] && SUB_ARGS2+=( --extra "$EXTRA_ARGS" )
-  [[ -n "$TAG_SUFFIX"    ]] && SUB_ARGS2+=( --tag-suffix "$TAG_SUFFIX" )
-  [[ -n "${PY:-}"        ]] && SUB_ARGS2+=( --py "$PY" )
+  if [[ -n "$_HYPERS_SINGLE" ]]; then
+    # shellcheck disable=SC2206
+    MAIN_ARGS_SINGLE+=( $_HYPERS_SINGLE )
+  fi
+  if [[ -n "$_SOTA_FLAGS_SINGLE" ]]; then
+    # _build_hypers 已经含 sota flags（因为我们把 flags 放进去了），避免重复：
+    #   注意：_build_hypers 返回的串里已经有 $_SOTA_FLAGS_SINGLE（最后追加）。
+    #   为避免 duplicated，这里如果 _HYPERS_SINGLE 已 contain "--use-revin"，就不再追加。
+    if [[ "$_HYPERS_SINGLE" != *"--use-revin"* ]]; then
+      # shellcheck disable=SC2206
+      MAIN_ARGS_SINGLE+=( $_SOTA_FLAGS_SINGLE )
+    fi
+  fi
+  if [[ -n "$_VRAMBS_SINGLE" ]]; then
+    # shellcheck disable=SC2206
+    MAIN_ARGS_SINGLE+=( $_VRAMBS_SINGLE )
+  fi
+  # TAG_SUFFIX → main.py --tag-suffix
+  if [[ -n "$TAG_SUFFIX" ]] && [[ "${TAG_SUFFIX}" != '""' ]]; then
+    MAIN_ARGS_SINGLE+=( --tag-suffix "$TAG_SUFFIX" )
+  fi
+  # EXTRA_ARGS (用户 CLI 最后 append，可覆写任何东西)
+  if [[ -n "$EXTRA_ARGS" ]]; then
+    # shellcheck disable=SC2206
+    MAIN_ARGS_SINGLE+=( $EXTRA_ARGS )
+  fi
 
   set +e
   if [[ $DRY_RUN -eq 1 ]]; then
-    echo "  [dry-run][${RUN_KEY}] 子命令: bash $0 ${SUB_ARGS2[*]}"
+    echo "${_SLOGAN_BAR_SINGLE}"
+    echo "  [dry-run][${RUN_KEY}] main.py 命令: ${_PY_CMD_SINGLE} ${MAIN_ARGS_SINGLE[*]}"
     SUB_EXIT2=0
   else
-    bash "$0" "${SUB_ARGS2[@]}"
+    echo "${_SLOGAN_BAR_SINGLE}"
+    echo "🚀 启动训练: ${_PY_CMD_SINGLE} ${MAIN_ARGS_SINGLE[*]}"
+    echo
+    "${_PY_CMD_SINGLE}" "${MAIN_ARGS_SINGLE[@]}"
     SUB_EXIT2=$?
   fi
   set -e
@@ -512,8 +715,12 @@ if [[ $RUN_EXIT_TOTAL -ne 0 ]]; then
   echo "共 ${RUN_EXIT_TOTAL} 个 run 失败。" >&2
   exit $RUN_EXIT_TOTAL
 fi
+# SINGLE/FULL 叶子层：for JOB 跑完所有 RUN_JOBS，就直接 exit 0，不要往下走 training launch 代码。
+# （避免 old single-dataset launch 代码重复再跑一次）
 exit 0
-# ================= 下面所有原 SINGLE-dataset 超参映射 + VRAM 检查 + 训练启动代码保留（子进程 single 模式会走到）==================
+# =================================================== training launch (只在 direct mode 用) ===================================================
+# 下方 training launch 代码只在：direct-debug 模式下才会走到（一般不会到）。
+# =================================================== training launch (只在 direct mode 用) ===================================================
 
 # ------------------------------------------------------------ setting 校验
 STANDARD_SEQS=" 96 336 512 "
