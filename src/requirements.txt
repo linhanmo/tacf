@@ -1,0 +1,12 @@
+numpy>=1.22
+pandas>=1.5
+torch>=2.1.0
+torchvision>=0.16
+mamba-ssm==2.2.2
+causal-conv1d==1.4.0
+PyYAML>=6.0
+tqdm>=4.65
+matplotlib>=3.7
+seaborn>=0.12
+scikit-learn>=1.2
+omegaconf>=2.3

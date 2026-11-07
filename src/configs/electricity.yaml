@@ -1,0 +1,26 @@
+data:
+  dataset: electricity
+  seq_len: 96
+  pred_len: 24
+  label_len: 48
+  batch_size: 16
+
+model:
+  in_channels: 321
+  out_channels: 321
+  d_hidden: 512
+
+  specialist:
+    d_model: 512
+    n_layers: 4
+    dropout: 0.15
+
+  aggregator:
+    d_model: 256
+
+training:
+  max_epochs: 100
+  early_stop: 15
+  lr: 0.0008
+  weight_decay: 0.0005
+  grad_clip: 2.0

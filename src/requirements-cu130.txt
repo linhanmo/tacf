@@ -1,0 +1,22 @@
+# RTX 5090 / CUDA 13 environment, Python 3.10 on Linux x86_64.
+# uv venv --python 3.10
+# uv pip install -r src/requirements-cu130.txt --index https://download.pytorch.org/whl/cu130
+torch==2.10.0
+torchvision==0.25.0
+numpy>=1.22,<2
+pandas>=1.5
+PyYAML>=6.0
+tqdm>=4.65
+matplotlib>=3.7
+seaborn>=0.12
+scikit-learn>=1.2
+omegaconf>=2.3
+setuptools
+packaging
+ninja
+einops
+transformers==4.44.2
+tokenizers<0.20
+pytest
+https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.7.0/causal_conv1d-1.7.0+cu13torch2.10cxx11abiTRUE-cp310-cp310-linux_x86_64.whl
+https://github.com/state-spaces/mamba/releases/download/v2.3.2.post1/mamba_ssm-2.3.2.post1+cu13torch2.10cxx11abiTRUE-cp310-cp310-linux_x86_64.whl

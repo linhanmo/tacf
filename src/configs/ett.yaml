@@ -1,0 +1,22 @@
+data:
+  dataset: ETTh1
+  seq_len: 336
+  pred_len: 168
+  label_len: 168
+  batch_size: 32
+
+model:
+  in_channels: 7
+  out_channels: 7
+  d_hidden: 512
+
+  specialist:
+    d_model: 512
+    n_layers: 4
+    dropout: 0.1
+
+training:
+  max_epochs: 80
+  early_stop: 10
+  lr: 0.001
+  batch_size: 32

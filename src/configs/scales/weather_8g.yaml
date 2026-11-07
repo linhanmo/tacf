@@ -1,0 +1,62 @@
+# Weather dataset (T=10min, D=21 features) - 8GB GPU preset
+# -----------------------------------------------------------
+# MODEL LOCKED per user instruction - SAME 512×4 / 256×2 as 24G preset.
+# Only BS_physical × accum adapted for 8GB safe cap 7.2GB.
+# -----------------------------------------------------------
+# BS_physical = 3
+# accum_steps = 16
+# BS_effective = 3 × 16 = 48   →  SAME effective dynamics as 24G preset.
+# -----------------------------------------------------------
+
+project:
+  name: tacf_weather_8g
+  seed: 42
+  device: cuda
+  amp: true
+
+data:
+  dataset: weather
+  root: preprocess
+  seq_len: 336
+  pred_len: 168
+  label_len: 168
+  batch_size: 3
+  num_workers: 4
+  pin_memory: true
+  use_time_features: true
+
+model:
+  specialist:
+    d_model: 512
+    n_layers: 4
+  aggregator:
+    d_model: 256
+    n_layers: 2
+
+training:
+  lr: 8.0e-4
+  weight_decay: 1e-4
+  grad_clip: 1.0
+  warmup_epochs: 5
+  grad_accum_steps: 16
+  stage1_max_epochs: 40
+  stage2_max_epochs: 15
+  stage3_max_epochs: 15
+  stage4_max_epochs: 30
+  early_stop_stage1: 15
+  early_stop_stage2: 6
+  early_stop_stage3: 6
+  early_stop_stage4: 8
+  stage4_lr_mult: 0.03
+  stage4_early_stop: 5
+
+loss:
+  lambda_nll: 2.0
+  lambda_mse: 1.0
+  lambda_consensus: 0.1
+  lambda_reject: 0.01
+  lambda_orthogonality: 0.01
+  lambda_agent: 0.05
+  lambda_cov_penalty: 0.25
+  target_q: 0.95
+  use_mixture_nll: false
